@@ -1,0 +1,16 @@
+# Parameters for the single-process tinynav_node. Wildcard applies to every
+# component; planning parameters mirror planning_node.py's declare_parameter set.
+/**:
+  ros__parameters:
+    # TensorRT engine directory; engine filenames carry the arch suffix.
+    model_dir: /tinynav/tinynav/models
+    # Map input (map format v2 dir; see docs/).
+    map_path: ""
+    db_path: /tinynav/tinynav_db
+    # Sim-site go2 value, mirroring run_simulator.sh's `-p min_wall_span_m:=0.2`
+    # on the python planner: a near-ground cell needs 0.2 m of z-span to count
+    # as obstacle (the class default 0.05 lets the trotting quadruped's smeared
+    # floor hits through and paints ESDF under the robot while driving).
+    min_wall_span_m: 0.2
+    # planning_node.py dynamic parameters (values filled by the planning port)
+    use_sim_time: false

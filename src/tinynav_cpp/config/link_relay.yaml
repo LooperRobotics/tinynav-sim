@@ -1,0 +1,19 @@
+# Relay table for the split-site deployment (tinynav_bridge, relay mode).
+#
+# Crossing topics arrive in the camera-box namespace: the x86 site remaps
+# perception's /slam/* products there at launch, so the canonical names
+# below exist ONLY on the Orin site — nothing double-matches across the
+# link. Stamp untouched; one DDS subscription per crossing topic (the
+# link-side fan-in of the looper_bridge fleet pattern).
+#
+# imu / infra2 camera_info / /clock cross directly (small, single Orin
+# consumer each, no local republish) and are deliberately absent here.
+relay:
+  - {type: Odometry, from: /camera/camera/slam/odometry_visual, to: /slam/odometry_visual, depth: 50, reliable: true}
+  - {type: Odometry, from: /camera/camera/slam/keyframe_odom, to: /slam/keyframe_odom, depth: 50, reliable: true}
+  - {type: Image, from: /camera/camera/slam/keyframe_image, to: /slam/keyframe_image, depth: 50, reliable: true}
+  - {type: Image, from: /camera/camera/slam/keyframe_depth, to: /slam/keyframe_depth, depth: 50, reliable: true}
+  # Per-frame depth: planning's latest_depth_only subscription is RELIABLE
+  # (KeepLast(1)) — the relay must match it (the fleet bridge also publishes
+  # every /slam/* topic with its reliable sensor_qos).
+  - {type: Image, from: /camera/camera/slam/depth, to: /slam/depth, depth: 5, reliable: true}
