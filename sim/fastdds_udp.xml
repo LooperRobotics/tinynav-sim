@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- FastDDS 2.6 profile, kept as the tuning starting point for the real
+     x86<->Orin link (the launches use FASTDDS_BUILTIN_TRANSPORTS=UDPv4 +
+     ROS_DISCOVERY_SERVER instead; this file adds what env vars cannot
+     express: interface whitelist and socket buffer sizes).
+
+     Usage: FASTRTPS_DEFAULT_PROFILES_FILE=sim/fastdds_udp.xml, and export
+     FASTRTPS_HOST_IP=<real NIC IP> for the $(...) substitution.
+
+     Hard-won notes (2026-09-20):
+     - NO xmlns on the root element: the 2.6 XML parser does not resolve the
+       namespace and reports "userTransports without content" while silently
+       dropping the whole profile.
+     - Transports are declared once under transport_descriptors and
+       REFERENCED by id via userTransport_id (the 2.6 schema; inline
+       <transport id=...> children of userTransports do not parse here). -->
+<profiles>
+  <transport_descriptors>
+    <transport_descriptor>
+      <transport_id>udp_only_transport</transport_id>
+      <type>UDPv4</type>
+      <sendBufferSize>2097152</sendBufferSize>
+      <receiveBufferSize>2097152</receiveBufferSize>
+    </transport_descriptor>
+  </transport_descriptors>
+  <participant profile_name="udp_only" is_default_profile="true">
+    <rtps>
+      <userTransports>
+        <userTransport_id>udp_only_transport</userTransport_id>
+      </userTransports>
+      <useBuiltinTransports>false</useBuiltinTransports>
+      <interfaceWhiteList>
+        <address>$(FASTRTPS_HOST_IP)</address>
+        <address>127.0.0.1</address>
+      </interfaceWhiteList>
+    </rtps>
+  </participant>
+</profiles>
