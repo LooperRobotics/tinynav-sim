@@ -34,7 +34,12 @@
 
 #include <rclcpp/rclcpp.hpp>
 
+// Jazzy's cv_bridge 4.x renamed the header to .hpp (Humble only has .h).
+#if __has_include(<cv_bridge/cv_bridge.hpp>)
+#include <cv_bridge/cv_bridge.hpp>
+#else
 #include <cv_bridge/cv_bridge.h>
+#endif
 #include <opencv2/imgcodecs.hpp>
 #include <message_filters/subscriber.h>
 #include <message_filters/synchronizer.h>
@@ -55,6 +60,7 @@
 #include "tinynav_cpp/kernels/pose_graph_solver.hpp"
 #include "tinynav_cpp/mapping/astar.hpp"
 #include "tinynav_cpp/mapping/fusion_window.hpp"
+#include "tinynav_cpp/mapping/live_capture.hpp"
 #include "tinynav_cpp/mapping/map_v2.hpp"
 #include "tinynav_cpp/mapping/path_prior.hpp"
 #include "tinynav_cpp/mapping/vlad.hpp"
@@ -64,16 +70,22 @@ namespace tinynav {
 
 class MappingComponent : public rclcpp::Node {
   public:
+    ~MappingComponent() override { live_.close(); }  // flush the live npys
     explicit MappingComponent(const rclcpp::NodeOptions& options)
         : Node("map_node", options) {
         std::string model_dir = "/tinynav/tinynav/models";
         std::string map_path;
+        std::string live_capture_dir;
         declare_parameter<std::string>("model_dir", model_dir);
         declare_parameter<std::string>("map_path", map_path);
         declare_parameter<bool>("climb_prior", true);
+        // scratch lives under the gitignored fixtures/ — a run from the repo
+        // root must never drop an untracked dir into the work tree
+        declare_parameter<std::string>("live_capture_dir", "fixtures/nav_temp_v2");
         model_dir = get_parameter("model_dir").as_string();
         map_path = get_parameter("map_path").as_string();
         climb_prior_ = get_parameter("climb_prior").as_bool();
+        live_.set_dir(get_parameter("live_capture_dir").as_string());
 
         super_point_extractor_ = std::make_unique<trt::SuperPointTRT>(model_dir);
         light_glue_matcher_ = std::make_unique<trt::LightGlueTRT>(model_dir);
@@ -289,11 +301,18 @@ class MappingComponent : public rclcpp::Node {
             map_index_ = std::move(map_index);
             relocalization_enabled_ = true;
             RCLCPP_INFO(get_logger(),
-                        "map v2 loaded: %zu keyframes, VLAD %ldx%ld — keyframe "
+                        "map v2 loaded: %zu keyframes, VLAD %ldx%ld f32 (%.0fMB), "
+                        "depth/features mmap-lazy (%.1fG on disk) — keyframe "
                         "relocalization enabled",
                         map_index_.timestamps.size(),
                         static_cast<long>(map_index_.vlad_descriptors.rows()),
-                        static_cast<long>(map_index_.vlad_descriptors.cols()));
+                        static_cast<long>(map_index_.vlad_descriptors.cols()),
+                        static_cast<double>(map_index_.vlad_descriptors.size() *
+                                            sizeof(float)) /
+                          (1024.0 * 1024.0),
+                        static_cast<double>(map_index_.depth_images_.file_bytes() +
+                                            map_index_.feature_descps_.file_bytes()) /
+                          (1024.0 * 1024.0 * 1024.0));
         } else {
             RCLCPP_WARN(get_logger(),
                         "map v2 index not loaded from %s (%s) — keyframe "
@@ -389,22 +408,34 @@ class MappingComponent : public rclcpp::Node {
             return;
         }
         const cv::Mat image = cv_bridge::toCvCopy(keyframe_image_msg, "mono8")->image;
+        const cv::Mat depth_img = cv_bridge::toCvCopy(depth_msg, "32FC1")->image;
         const Eigen::Matrix4d odom = odom_to_T(keyframe_odom_msg);
-        // nav_temp_db kept the keyframe depth for the loop-closure PnP; keep it
-        // in memory under the keyframe timestamp.
-        {
-            const cv::Mat depth_img = cv_bridge::toCvCopy(depth_msg, "32FC1")->image;
-            Eigen::MatrixXd depth_e(depth_img.rows, depth_img.cols);
-            for (int r = 0; r < depth_img.rows; ++r) {
-                for (int c = 0; c < depth_img.cols; ++c) {
-                    depth_e(r, c) = depth_img.at<float>(r, c);
-                }
-            }
-            depth_of_[keyframe_image_timestamp] = std::move(depth_e);
+
+        Features features;
+        if (super_point_extractor_->infer(image, superpoint_results_)) {
+            features.kpts = superpoint_results_["kpts"];
+            features.descps = superpoint_results_["descps"];
+            const auto it = superpoint_results_.find("mask");
+            if (it != superpoint_results_.end()) features.mask = it->second;
+            latest_keyframe_features_ = {keyframe_image_timestamp, features};
+        } else {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+                                 "superpoint engine unavailable: mapping degraded");
         }
 
-        // embedding (DINOv2); degrade to no embedding when the engine is out.
-        if (dinov2_model_->available()) {
+        // nav_temp_db parity: depth + features land in the on-disk scratch
+        // store (u16-mm depth), loop closure reads them back per candidate —
+        // per-session RSS no longer scales with keyframe count. A frame whose
+        // append failed is simply invisible to loop closure.
+        if (!live_.append(keyframe_image_timestamp, depth_img, features.kpts,
+                          features.descps, features.mask)) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+                                 "live capture append failed: keyframe %ld stays "
+                                 "out of loop closure",
+                                 static_cast<long>(keyframe_image_timestamp));
+        } else if (dinov2_model_->available()) {
+            // Embedding only when the frame actually persisted: find_loop's
+            // candidates must never point at a missing store entry.
             std::vector<float> embedding;
             if (dinov2_model_->infer(image, embedding)) {
                 embeddings_[keyframe_image_timestamp] =
@@ -415,19 +446,6 @@ class MappingComponent : public rclcpp::Node {
         } else {
             RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
                                  "dinov2 engine unavailable: loop closure disabled");
-        }
-
-        Features features;
-        if (super_point_extractor_->infer(image, superpoint_results_)) {
-            features.kpts = superpoint_results_["kpts"];
-            features.descps = superpoint_results_["descps"];
-            const auto it = superpoint_results_.find("mask");
-            if (it != superpoint_results_.end()) features.mask = it->second;
-            features_[keyframe_image_timestamp] = features;
-            latest_keyframe_features_ = {keyframe_image_timestamp, features};
-        } else {
-            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
-                                 "superpoint engine unavailable: mapping degraded");
         }
 
         if (odom_.empty() && !last_keyframe_timestamp_.has_value()) {
@@ -478,17 +496,29 @@ class MappingComponent : public rclcpp::Node {
         for (const auto& [idx, similarity] : loop_list) {
             const int64_t prev_timestamp = valid_timestamp[static_cast<size_t>(idx)];
             const int64_t curr_timestamp = timestamp;
-            const auto prev_it = features_.find(prev_timestamp);
-            const auto curr_it = features_.find(curr_timestamp);
-            if (prev_it == features_.end() || curr_it == features_.end()) continue;
+            mapping::MapV2Features prev_feat, curr_feat;
+            if (!live_.get_features(prev_timestamp, prev_feat) ||
+                !live_.get_features(curr_timestamp, curr_feat)) {
+                continue;
+            }
             auto [prev_matched, curr_matched, matches] =
-                match_keypoints(prev_it->second, curr_it->second);
+                match_keypoints(prev_feat, curr_feat);
             if (matches.rows() == 0) continue;
+            // u16-mm rows convert back to f32 meters per candidate — event-
+            // level cost; the old per-keyframe MatrixXd copy is gone.
+            const cv::Mat curr_depth = live_.get_depth(curr_timestamp);
+            Eigen::MatrixXd curr_depth_mat;
+            if (!curr_depth.empty()) {
+                curr_depth_mat.resize(curr_depth.rows, curr_depth.cols);
+                curr_depth_mat =
+                    Eigen::Map<Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic,
+                                             Eigen::RowMajor>>(
+                        reinterpret_cast<float*>(curr_depth.data), curr_depth.rows,
+                        curr_depth.cols)
+                        .cast<double>();
+            }
             const core::EstimatePoseResult est = core::estimate_pose(
-                prev_matched, curr_matched, depth_of_.count(curr_timestamp)
-                                              ? depth_of_.at(curr_timestamp)
-                                              : Eigen::MatrixXd(),
-                *K_, {});
+                prev_matched, curr_matched, curr_depth_mat, *K_, {});
             if (est.success && est.inlier_idx_original.size() >= 100) {
                 relative_pose_constraint_.emplace_back(curr_timestamp, prev_timestamp,
                                                        est.pose);
@@ -665,10 +695,12 @@ class MappingComponent : public rclcpp::Node {
         const Eigen::VectorXd query_vlad =
             mapping::compute_vlad(patch_tokens, map_index_.vlad_centres);
         // select_relocalization_candidates: find_loop over the map descriptors
-        // with threshold -1.0 — top-k by similarity, best LAST.
+        // with threshold -1.0 — top-k by similarity, best LAST. The index is
+        // f32 (Orin Nano 8G; python keeps it f32 too) — cast the query once.
+        const Eigen::VectorXf query_vlad_f = query_vlad.cast<float>();
         std::vector<std::pair<int, double>> scored;
         for (int i = 0; i < map_index_.vlad_descriptors.rows(); ++i) {
-            scored.emplace_back(i, map_index_.vlad_descriptors.row(i).dot(query_vlad));
+            scored.emplace_back(i, map_index_.vlad_descriptors.row(i).dot(query_vlad_f));
         }
         std::stable_sort(scored.begin(), scored.end(),
                          [](const auto& a, const auto& b) { return a.second < b.second; });
@@ -688,16 +720,22 @@ class MappingComponent : public rclcpp::Node {
         std::vector<std::pair<Eigen::MatrixX3d, Eigen::MatrixX2d>> pnp_candidates;
         for (const auto& [row, similarity] : candidates) {
             const int64_t ts = map_index_.timestamps[static_cast<size_t>(row)];
-            const auto feat_it = map_index_.features.find(ts);
-            const auto depth_it = map_index_.depth.find(ts);
             const auto pose_it = map_index_.poses.find(ts);
-            if (feat_it == map_index_.features.end() || depth_it == map_index_.depth.end() ||
-                pose_it == map_index_.poses.end() || feat_it->second.kpts.empty() ||
-                depth_it->second.empty()) {
+            if (pose_it == map_index_.poses.end()) {
+                continue;
+            }
+            // Python parity: depth/features come from the map shelve only for
+            // the candidate keyframes that reach matching — mmap views here.
+            mapping::MapV2Features map_features;
+            if (!map_index_.get_features(ts, map_features)) {
+                continue;
+            }
+            const cv::Mat map_depth = map_index_.get_depth(ts);
+            if (map_features.kpts.empty() || map_depth.empty()) {
                 continue;
             }
             auto [reference_matched_keypoints, keyframe_matched_keypoints, matches] =
-                match_keypoints(feat_it->second, features);
+                match_keypoints(map_features, features);
             if (matches.rows() < 50) {
                 // The Python prints this unconditionally for every rejected
                 // candidate; keep it visible (INFO) for field diagnosis.
@@ -706,13 +744,13 @@ class MappingComponent : public rclcpp::Node {
                             static_cast<long>(matches.rows()), static_cast<long>(ts));
                 reloc_dump_failure(timestamp_ns, ts, similarity,
                                    static_cast<long>(matches.rows()), image,
-                                   feat_it->second.kpts, feat_it->second.descps,
-                                   feat_it->second.mask, features.kpts, features.descps,
+                                   map_features.kpts, map_features.descps,
+                                   map_features.mask, features.kpts, features.descps,
                                    features.mask);
                 continue;
             }
             const auto [point_3d_in_world, inliers] = mapping::keypoint_with_depth_to_3d(
-                reference_matched_keypoints, depth_it->second, pose_it->second, *map_K_);
+                reference_matched_keypoints, map_depth, pose_it->second, *map_K_);
             std::vector<Eigen::Vector3d> pts3d;
             std::vector<Eigen::Vector2d> pts2d;
             for (int i = 0; i < point_3d_in_world.rows(); ++i) {
@@ -1303,9 +1341,10 @@ class MappingComponent : public rclcpp::Node {
     std::optional<mapping::PathSpeedIndex> speed_index_;
     std::optional<mapping::PathClimbIndex> climb_index_;
 
-    // live keyframe state (nav_temp_db replacement)
-    std::unordered_map<int64_t, Features> features_;
-    std::unordered_map<int64_t, Eigen::MatrixXd> depth_of_;
+    // live keyframe state (nav_temp_db replacement): depth/features on disk
+    // (LiveCapture, scratch-wiped per session), embeddings stay in RAM —
+    // find_loop scans them on every keyframe and 3KB each is nothing.
+    mapping::LiveCapture live_;
     std::unordered_map<int64_t, Eigen::VectorXd> embeddings_;
     std::pair<int64_t, Features> latest_keyframe_features_{-1, Features{}};
 
