@@ -148,11 +148,6 @@ std::vector<int64_t> as_int64(const NpyArray & a)
   return out;
 }
 
-std::vector<uint8_t> as_u8(const NpyArray & a)
-{
-  return a.bytes;
-}
-
 bool expect(const NpyArray & a, NpyArray::DType dtype, std::vector<int64_t> shape,
   const char * name, std::string & error)
 {
@@ -240,94 +235,136 @@ bool load_map_v2(const std::string & dir, MapV2 & out, std::string & error)
     return false;
   }
   {
-    const std::vector<double> data = as_doubles(arr);
+    // f32 row-major, memcpy'd straight from the npy (f8 input is cast —
+    // nothing in the wild writes f8 descriptors, but the old reader accepted
+    // it). The 1.9G-at-dog-scale f64 intermediate is gone: Orin Nano 8G.
     const int64_t d = arr.shape[1];
     out.vlad_descriptors.resize(n, d);
-    for (int64_t r = 0; r < n; ++r) {
-      for (int64_t col = 0; col < d; ++col) {
-        out.vlad_descriptors(r, col) = data[static_cast<size_t>(r * d + col)];
+    if (arr.dtype == NpyArray::DType::F4) {
+      std::memcpy(out.vlad_descriptors.data(), arr.bytes.data(), arr.bytes.size());
+    } else {
+      const auto * src = reinterpret_cast<const double *>(arr.bytes.data());
+      for (size_t i = 0; i < out.vlad_descriptors.size(); ++i) {
+        out.vlad_descriptors.data()[i] = static_cast<float>(src[i]);
       }
     }
   }
 
+  // Depth/features stay on disk (python reads them from the TinyNavDB shelve
+  // per candidate keyframe): mmap the flat npys and touch rows on access.
   if (!read_npy(dir + "/feature_offsets.npy", arr, error) ||
     !expect(arr, NpyArray::DType::I8, {n + 1}, "feature_offsets.npy", error))
   {
     return false;
   }
-  const std::vector<int64_t> offsets = as_int64(arr);
+  out.feature_offsets_ = as_int64(arr);
 
-  if (!read_npy(dir + "/feature_kpts.npy", arr, error) || arr.shape.size() != 2 ||
-    arr.shape[1] != 2 || arr.dtype != NpyArray::DType::F4)
+  if (!out.feature_kpts_.open(dir + "/feature_kpts.npy", error) ||
+    out.feature_kpts_.shape().size() != 2 || out.feature_kpts_.shape()[1] != 2 ||
+    out.feature_kpts_.dtype() != MappedNpy::DType::F4)
   {
     error = "feature_kpts.npy: " + error;
     return false;
   }
-  const int64_t m = arr.shape[0];
-  const std::vector<float> kpts = [&] {
-    std::vector<float> v(m * 2);
-    std::memcpy(v.data(), arr.bytes.data(), arr.bytes.size());
-    return v;
-  }();
-  if (!read_npy(dir + "/feature_descps.npy", arr, error) || arr.shape.size() != 2 ||
-    arr.shape[0] != m || arr.dtype != NpyArray::DType::F4)
+  if (!out.feature_descps_.open(dir + "/feature_descps.npy", error) ||
+    out.feature_descps_.shape().size() != 2 ||
+    out.feature_descps_.dtype() != MappedNpy::DType::F4)
   {
     error = "feature_descps.npy: " + error;
     return false;
   }
-  const int64_t desc_dim = arr.shape[1];
-  std::vector<float> descps(arr.count());
-  std::memcpy(descps.data(), arr.bytes.data(), arr.bytes.size());
-  if (!read_npy(dir + "/feature_mask.npy", arr, error) ||
-    !expect(arr, NpyArray::DType::U1, {m}, "feature_mask.npy", error))
-  {
+  out.desc_dim_ = out.feature_descps_.shape()[1];
+  const int64_t m = out.feature_kpts_.rows();
+  if (out.feature_descps_.rows() != m) {
+    error = "feature_descps.npy: rows != feature_kpts rows";
     return false;
   }
-  const std::vector<uint8_t> mask = as_u8(arr);
-
+  if (!out.feature_mask_.open(dir + "/feature_mask.npy", error) ||
+    out.feature_mask_.dtype() != MappedNpy::DType::U1 ||
+    out.feature_mask_.shape() != std::vector<int64_t>{m})
+  {
+    error = "feature_mask.npy: " + error;
+    return false;
+  }
   for (int64_t i = 0; i < n; ++i) {
-    const int64_t begin = offsets[static_cast<size_t>(i)];
-    const int64_t end = offsets[static_cast<size_t>(i) + 1];
+    const int64_t begin = out.feature_offsets_[static_cast<size_t>(i)];
+    const int64_t end = out.feature_offsets_[static_cast<size_t>(i) + 1];
     if (begin < 0 || end < begin || end > m) {
       error = "feature_offsets inconsistent";
       return false;
     }
-    const int rows = static_cast<int>(end - begin);
-    MapV2Features feat;
-    if (rows > 0) {
-      const int sz_k[3] = {1, rows, 2};
-      feat.kpts = cv::Mat(3, sz_k, CV_32F);
-      std::memcpy(feat.kpts.data, kpts.data() + begin * 2,
-        static_cast<size_t>(rows) * 2 * sizeof(float));
-      const int sz_d[3] = {1, rows, static_cast<int>(desc_dim)};
-      feat.descps = cv::Mat(3, sz_d, CV_32F);
-      std::memcpy(feat.descps.data, descps.data() + begin * desc_dim,
-        static_cast<size_t>(rows) * desc_dim * sizeof(float));
-      const int sz_m[3] = {1, rows, 1};
-      feat.mask = cv::Mat(3, sz_m, CV_8U);
-      std::memcpy(feat.mask.data, mask.data() + begin,
-        static_cast<size_t>(rows));
-    }
-    out.features[out.timestamps[static_cast<size_t>(i)]] = std::move(feat);
+    out.row_of_[out.timestamps[static_cast<size_t>(i)]] = static_cast<uint32_t>(i);
   }
 
-  if (!read_npy(dir + "/depth_images.npy", arr, error) || arr.shape.size() != 3 ||
-    arr.shape[0] != n || arr.dtype != NpyArray::DType::F4)
+  if (!out.depth_images_.open(dir + "/depth_images.npy", error) ||
+    out.depth_images_.shape().size() != 3 || out.depth_images_.shape()[0] != n ||
+    !(out.depth_images_.dtype() == MappedNpy::DType::F4 ||
+      out.depth_images_.dtype() == MappedNpy::DType::U2))
   {
-    error = "depth_images.npy: " + error;
+    error = "depth_images.npy: " + error +
+            " (want [N,H,W] <f4 meters or <u2 millimeters)";
     return false;
   }
-  {
-    const int64_t h = arr.shape[1], w = arr.shape[2];
-    const size_t frame_bytes = static_cast<size_t>(h * w) * sizeof(float);
-    for (int64_t i = 0; i < n; ++i) {
-      cv::Mat depth(static_cast<int>(h), static_cast<int>(w), CV_32F);
-      std::memcpy(depth.data, arr.bytes.data() + static_cast<size_t>(i) * frame_bytes,
-        frame_bytes);
-      out.depth[out.timestamps[static_cast<size_t>(i)]] = std::move(depth);
-    }
-  }
   return true;
+}
+
+bool MapV2::has_frame(const int64_t ts) const
+{
+  return row_of_.find(ts) != row_of_.end() && depth_images_.ok();
+}
+
+bool MapV2::get_features(const int64_t ts, MapV2Features & out) const
+{
+  out = MapV2Features{};
+  const auto it = row_of_.find(ts);
+  if (it == row_of_.end() || !feature_kpts_.ok()) {
+    return false;
+  }
+  const size_t i = it->second;
+  const int64_t begin = feature_offsets_[i];
+  const int64_t end = feature_offsets_[i + 1];
+  const int rows = static_cast<int>(end - begin);
+  if (rows <= 0) {
+    return true;  // keyframe stored no features — caller skips empty kpts
+  }
+  const int sz_k[3] = {1, rows, 2};
+  out.kpts = cv::Mat(3, sz_k, CV_32F,
+    const_cast<void *>(feature_kpts_.row(static_cast<size_t>(begin))));
+  const int sz_d[3] = {1, rows, static_cast<int>(desc_dim_)};
+  out.descps = cv::Mat(3, sz_d, CV_32F,
+    const_cast<void *>(feature_descps_.row(static_cast<size_t>(begin))));
+  const int sz_m[3] = {1, rows, 1};
+  out.mask = cv::Mat(3, sz_m, CV_8U,
+    const_cast<void *>(feature_mask_.row(static_cast<size_t>(begin))));
+  return true;
+}
+
+cv::Mat MapV2::get_depth(const int64_t ts) const
+{
+  const auto it = row_of_.find(ts);
+  if (it == row_of_.end() || !depth_images_.ok() || depth_images_.shape().size() != 3) {
+    return {};
+  }
+  const int64_t h = depth_images_.shape()[1], w = depth_images_.shape()[2];
+  if (depth_images_.dtype() == MappedNpy::DType::F4) {
+    // legacy f32-meters maps: zero-copy view over the mapping
+    return cv::Mat(static_cast<int>(h), static_cast<int>(w), CV_32F,
+      const_cast<void *>(depth_images_.row(static_cast<size_t>(it->second))));
+  }
+  if (depth_images_.dtype() != MappedNpy::DType::U2) {
+    return {};
+  }
+  // u16 millimeters (the writer's halved footprint): convert to f32 meters on
+  // touch. One candidate frame per reloc query — the copy is noise next to
+  // the matching, and 1 mm quantization is far below stereo depth noise.
+  const auto * src = static_cast<const uint16_t *>(depth_images_.row(static_cast<size_t>(it->second)));
+  cv::Mat out(static_cast<int>(h), static_cast<int>(w), CV_32F);
+  const size_t n = static_cast<size_t>(h) * static_cast<size_t>(w);
+  for (size_t i = 0; i < n; ++i) {
+    out.at<float>(static_cast<int>(i / w), static_cast<int>(i % w)) =
+      static_cast<float>(src[i]) * 0.001f;
+  }
+  return out;
 }
 
 std::pair<Eigen::MatrixX3d, std::vector<bool>> keypoint_with_depth_to_3d(

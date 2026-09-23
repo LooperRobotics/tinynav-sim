@@ -21,7 +21,8 @@ load without pickle/shelve, all rows ordered by ascending timestamp:
   feature_kpts.npy    [M,2] f32  (canonical [N,2] (x,y) pixel coords)
   feature_descps.npy  [M,D] f32
   feature_mask.npy    [M] u1
-  depth_images.npy    [N,H,W] f32
+  depth_images.npy    [N,H,W] u2 millimeters (0 = invalid; the C++ reader
+                      converts back to f32 meters per candidate frame)
   meta.json           informational (count/dims); the C++ reader validates by shape
   + copies of the plain .npy files above.
 
@@ -119,7 +120,13 @@ def main(src: str, dst: str) -> None:
         elif dep.shape != depth_hw:
             sys.exit(f"depth for ts={t} shape {dep.shape} != {depth_hw}")
         depth_frames.append(dep)
-    depth_images = np.stack(depth_frames, axis=0)
+    # u16 millimeters: half the f32 footprint (the dog's 13G depths.db becomes
+    # ~6.5G). 0 stays "invalid", negatives clamp to 0, >65.535m clamps — the
+    # reloc PnP cutoff is 50m. The C++ reader converts back to f32 meters per
+    # candidate frame.
+    depth_images = np.clip(
+        np.stack(depth_frames, axis=0).astype(np.float64) * 1000.0, 0.0,
+        65535.0).round().astype(np.uint16)
 
     os.makedirs(dst, exist_ok=True)
     np.save(os.path.join(dst, "pose_timestamps.npy"), np.asarray(timestamps, dtype=np.int64))
@@ -141,7 +148,8 @@ def main(src: str, dst: str) -> None:
 
     meta = {
         "format": "tinynav_map_v2",
-        "version": 1,
+        "version": 2,
+        "depth_dtype": "u2_mm",
         "count": int(n),
         "depth_height": int(depth_hw[0]),
         "depth_width": int(depth_hw[1]),

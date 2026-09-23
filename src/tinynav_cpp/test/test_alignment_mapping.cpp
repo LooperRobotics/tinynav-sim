@@ -4,6 +4,7 @@
 // expected arrays. Tests SKIP when fixtures/ is absent.
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -164,7 +165,8 @@ TEST(map_v2_alignment, load_round_trip) {
     ASSERT_TRUE(load_fixture_npy_i64("fixtures/map_v2/expected/feature_offsets.npy", offsets));
     ASSERT_EQ(offsets.size(), 6u);
     for (int i = 0; i < 5; ++i) {
-        const auto& feat = map.features.at(map.timestamps[static_cast<size_t>(i)]);
+        tinynav::mapping::MapV2Features feat;
+        ASSERT_TRUE(map.get_features(map.timestamps[static_cast<size_t>(i)], feat));
         const int rows = static_cast<int>(offsets[i + 1] - offsets[i]);
         ASSERT_EQ(feat.kpts.dims, 3);
         ASSERT_EQ(feat.kpts.size[0], 1);
@@ -187,7 +189,8 @@ TEST(map_v2_alignment, load_round_trip) {
     // the fixture generator seeded).
     ASSERT_TRUE(load_fixture_npy_doubles("fixtures/map_v2/expected/feature_descps.npy", shape, data));
     for (int i = 0; i < 5; ++i) {
-        const auto& feat = map.features.at(map.timestamps[static_cast<size_t>(i)]);
+        tinynav::mapping::MapV2Features feat;
+        ASSERT_TRUE(map.get_features(map.timestamps[static_cast<size_t>(i)], feat));
         const int rows = static_cast<int>(offsets[i + 1] - offsets[i]);
         for (int j = 0; j < rows; ++j) {
             const int src = offsets[i] + j;
@@ -198,18 +201,21 @@ TEST(map_v2_alignment, load_round_trip) {
         }
     }
 
-    // depth planes
+    // depth planes (u16 mm on disk; the reader converts back to f32 meters —
+    // allow the ±0.5mm quantization)
     ASSERT_TRUE(load_fixture_npy_doubles("fixtures/map_v2/expected/depth_images.npy", shape, data));
     expect_shape({5, 12, 16});
     for (int i = 0; i < 5; ++i) {
-        const cv::Mat& depth = map.depth.at(map.timestamps[static_cast<size_t>(i)]);
+        const cv::Mat depth = map.get_depth(map.timestamps[static_cast<size_t>(i)]);
+        ASSERT_FALSE(depth.empty());
         ASSERT_EQ(depth.rows, 12);
         ASSERT_EQ(depth.cols, 16);
         ASSERT_EQ(depth.type(), CV_32F);
         for (int r = 0; r < 12; ++r) {
             for (int c = 0; c < 16; ++c) {
-                EXPECT_FLOAT_EQ(depth.at<float>(r, c),
-                                static_cast<float>(data[i * 12 * 16 + r * 16 + c]));
+                EXPECT_NEAR(depth.at<float>(r, c),
+                            static_cast<float>(data[i * 12 * 16 + r * 16 + c]),
+                            5.1e-4);
             }
         }
     }
@@ -224,7 +230,8 @@ TEST(map_v2_alignment, keypoint_with_depth_to_3d) {
     ASSERT_TRUE(tinynav::mapping::load_map_v2("fixtures/map_v2/v2", map, error)) << error;
 
     const Eigen::Matrix4d& pose = map.poses.at(map.timestamps[0]);
-    const cv::Mat& depth = map.depth.at(map.timestamps[0]);
+    const cv::Mat depth = map.get_depth(map.timestamps[0]);
+    ASSERT_FALSE(depth.empty());
     Eigen::Matrix3d K = Eigen::Matrix3d::Identity();
     K(0, 0) = 272.0; K(1, 1) = 272.0; K(0, 2) = 272.0; K(1, 2) = 240.0;
 
@@ -258,4 +265,88 @@ TEST(map_v2_alignment, missing_dir_degrades) {
     std::string error;
     EXPECT_FALSE(tinynav::mapping::load_map_v2("fixtures/map_v2/does_not_exist", map, error));
     EXPECT_FALSE(error.empty());
+}
+
+TEST(map_v2_alignment, lazy_views_non_owning_and_missing_degrade) {
+    if (!fixtures_available()) {
+        GTEST_SKIP() << "fixtures/map_v2 not exported; run tools/export_map_v2_fixtures.py";
+    }
+    tinynav::mapping::MapV2 map;
+    std::string error;
+    ASSERT_TRUE(tinynav::mapping::load_map_v2("fixtures/map_v2/v2", map, error)) << error;
+
+    // Features must be views over the mmap, never per-keyframe copies: the
+    // Mat data pointers must land exactly on the mapped file rows. Depth may
+    // legitimately return an owning Mat — u16 mm converts to f32 meters on
+    // touch (the f4 zero-copy branch is covered by the f32-map e2e).
+    tinynav::mapping::MapV2Features feat;
+    ASSERT_TRUE(map.get_features(map.timestamps[0], feat));
+    ASSERT_FALSE(feat.descps.empty());
+    EXPECT_EQ(static_cast<const void*>(feat.descps.data),
+              map.feature_descps_.row(
+                  static_cast<size_t>(map.feature_offsets_[0])))
+        << "descps must be an mmap view";
+    const cv::Mat depth = map.get_depth(map.timestamps[0]);
+    ASSERT_FALSE(depth.empty());
+    EXPECT_EQ(depth.type(), CV_32F);
+    EXPECT_TRUE(map.has_frame(map.timestamps[0]));
+
+    // Unknown timestamps degrade exactly like the old .find() == end() path.
+    const int64_t absent = -123;
+    EXPECT_FALSE(map.has_frame(absent));
+    EXPECT_TRUE(map.get_depth(absent).empty());
+    tinynav::mapping::MapV2Features absent_feat;
+    EXPECT_FALSE(map.get_features(absent, absent_feat));
+}
+
+namespace {
+long vm_rss_kb() {
+    std::ifstream status("/proc/self/status");
+    std::string line;
+    while (std::getline(status, line)) {
+        if (line.rfind("VmRSS:", 0) == 0) {
+            return std::strtol(line.c_str() + 6, nullptr, 10);
+        }
+    }
+    return -1;
+}
+}  // namespace
+
+// The reason the loader went lazy: a yishang-scale map holds >10G of depth
+// planes; eager materialization OOMs every Jetson that isn't an AGX. Generate
+// the fixture with tools/make_stress_map_v2.py — this test asserts loading
+// such a map keeps RSS near-baseline and touching a few candidate frames
+// faults only those pages.
+TEST(map_v2_alignment, stress_map_stays_lazy) {
+    if (!std::filesystem::exists("fixtures/map_v2_stress/v2/pose_timestamps.npy")) {
+        GTEST_SKIP() << "fixtures/map_v2_stress not generated; run tools/make_stress_map_v2.py";
+    }
+    const long before = vm_rss_kb();
+    tinynav::mapping::MapV2 map;
+    std::string error;
+    ASSERT_TRUE(tinynav::mapping::load_map_v2("fixtures/map_v2_stress/v2", map, error)) << error;
+    const long loaded = vm_rss_kb();
+    const double depth_gb =
+        static_cast<double>(map.depth_images_.file_bytes()) / (1024.0 * 1024.0 * 1024.0);
+    ASSERT_GT(depth_gb, 2.0) << "stress fixture too small to prove laziness";
+    EXPECT_LT(loaded - before, 1'000'000L)  // < 1G while the file holds >2G
+        << "map load materialized the arrays — laziness regressed";
+
+    // Touch every 8th frame (reloc's real pattern is a few candidates per
+    // query): only those pages may fault in.
+    const size_t stride = map.timestamps.size() / 8 + 1;
+    for (size_t i = 0; i < map.timestamps.size(); i += stride) {
+        const cv::Mat depth = map.get_depth(map.timestamps[i]);
+        ASSERT_FALSE(depth.empty());
+        double sink = 0.0;
+        for (int r = 0; r < depth.rows; r += 37) {
+            sink += depth.at<float>(r, r % depth.cols);
+        }
+        tinynav::mapping::MapV2Features feat;
+        ASSERT_TRUE(map.get_features(map.timestamps[i], feat));
+        EXPECT_FALSE(feat.kpts.empty());
+    }
+    const long touched = vm_rss_kb();
+    EXPECT_LT(touched - loaded, 500'000L)  // < 500M for 8 touched frames
+        << "touching a few frames faulted in the whole file";
 }
