@@ -31,7 +31,12 @@
 
 #include <rclcpp/rclcpp.hpp>
 
+// Jazzy's cv_bridge 4.x renamed the header to .hpp (Humble only has .h).
+#if __has_include(<cv_bridge/cv_bridge.hpp>)
+#include <cv_bridge/cv_bridge.hpp>
+#else
 #include <cv_bridge/cv_bridge.h>
+#endif
 #include <message_filters/subscriber.h>
 #include <message_filters/synchronizer.h>
 #include <message_filters/sync_policies/approximate_time.h>
@@ -156,8 +161,11 @@ class PerceptionComponent : public rclcpp::Node {
     static constexpr int kMinFeatures = 20;
     static constexpr int kMinPnpInliers = 20;  // python: len(inlier_set) > 20
     static constexpr int kMinTrackObservations = 2;
-    static constexpr double kKeyframeMinDistance = 0.1;      // m
-    static constexpr double kKeyframeMinRotateDegree = 0.1;  // deg
+    // Yishang 2026-09-23: python default 0.1/0.1 keeps ~every frame at walking
+    // speed (9587 kf per route map, 13G depths.db on the dog) — spaced out as
+    // part of the map-size work; the 3 s timeout in the publish gate is unchanged.
+    static constexpr double kKeyframeMinDistance = 0.3;     // m
+    static constexpr double kKeyframeMinRotateDegree = 10.0; // deg
 
     static double stamp2second(const builtin_interfaces::msg::Time& stamp) {
         const int64_t nano =
