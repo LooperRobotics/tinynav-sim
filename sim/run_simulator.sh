@@ -68,6 +68,18 @@ WS_ROOT="$(dirname "$SIM_ROOT")"
 # from the venv site-packages). The image's python3 (/opt/venv/bin) already
 # carries its site-packages + /3rdparty/gtsam on PYTHONPATH via the image ENV.
 export PYTHONPATH="$WS_ROOT/reference:${PYTHONPATH}"
+# CycloneDDS everywhere (launch files, gz bridge, python nodes): the split
+# rig pairs Humble (x86) with a Jazzy Orin, and Fast DDS type namespacing on
+# Jazzy breaks cross-distro type matching. CYCLONEDDS_URI stays unset for
+# plain local runs (default config suffices on one machine); export it to
+# pin the USB-link unicast peers (src/tinynav_cpp/config/cyclonedds_x86.xml).
+export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}"
+# The image ENV bakes CYCLONEDDS_URI to /tinynav/scripts/cyclone_dds_localhost.xml,
+# which no longer exists in the rig container — every rmw_cyclonedds node then
+# dies at domain creation ("can't open configuration file"). Clear it for plain
+# local runs (Cyclone defaults suffice on one machine); the split-site launches
+# set their own CYCLONEDDS_URI later and override this.
+export CYCLONEDDS_URI=""
 WITH_MAP=0
 # defaults: the go2 rig on the featureless empty world; yard (textured anchor
 # walls) is the drive-test pick via --world.
@@ -224,7 +236,7 @@ win() {
   tmux set-option -w -t "$SESSION:$1" automatic-rename off
   # The image's bashrc resets the environment: re-export what the windows need
   # explicitly, BEFORE the window command runs.
-  tmux send-keys -t "$SESSION:$1" "export PYTHONPATH=\"$PYTHONPATH\" IGN_GAZEBO_RESOURCE_PATH=\"$IGN_GAZEBO_RESOURCE_PATH\" TINYNAV_DB_PATH=\"$TINYNAV_DB_PATH\"" Enter
+  tmux send-keys -t "$SESSION:$1" "export PYTHONPATH=\"$PYTHONPATH\" IGN_GAZEBO_RESOURCE_PATH=\"$IGN_GAZEBO_RESOURCE_PATH\" TINYNAV_DB_PATH=\"$TINYNAV_DB_PATH\" RMW_IMPLEMENTATION=\"$RMW_IMPLEMENTATION\" CYCLONEDDS_URI=\"\"" Enter
   tmux send-keys -t "$SESSION:$1" "$2" Enter
 }
 
