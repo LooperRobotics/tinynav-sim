@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<!-- CycloneDDS config for the x86 sim site of the split deployment.
+
+Why CycloneDDS here at all: the two sites run different ROS 2 distros
+(Humble x86 <-> Jazzy Orin), and Jazzy's rmw_fastrtps enables type
+namespacing by default — DDS type identifiers stop matching Humble's, so
+topics discover but never deliver (and rmw_fastrtps#797 can OOM the Humble
+side). Same-vendor CycloneDDS on both ends keeps type naming identical
+across distros.
+
+Why unicast peers instead of multicast: the link is a point-to-point USB
+RNDIS network (192.168.55.0/24, x86 = .100, Orin = .1) where multicast
+support is unreliable; explicit peers give the same deterministic discovery
+the old FastDDS Discovery Server provided, with no server process. The
+loopback peer covers same-host discovery; data rides the announced
+192.168.55.x locators via unicast. -->
+<CycloneDDS xmlns="https://cdds.io/config">
+  <Domain Id="any">
+    <General>
+      <!-- Bind the USB link explicitly: on a multi-NIC host cyclone picks
+           the general interface "arbitrarily" (it grabbed the WiFi on this
+           rig), which strands both discovery and data off the 192.168.55.x
+           link. name= (not ip=): cyclonedds 0.10.4 (Humble) rejects ip=.
+           lo is kept so same-host sim processes discover each other; with
+           only enxaac configured, loopback is implicitly excluded. -->
+      <Interfaces>
+        <NetworkInterface name="enxaac4cf20a190"/>
+      </Interfaces>
+      <!-- Multicast stays ENABLED: SPDP on the pinned USB link finds the
+           Orin peer and same-host processes alike. (AllowMulticast=false +
+           Peers was tried: cyclone's unicast SPDP to the peer then fails
+           with retcode -3, and local discovery dies with loopback.) -->
+    </General>
+  </Domain>
+</CycloneDDS>

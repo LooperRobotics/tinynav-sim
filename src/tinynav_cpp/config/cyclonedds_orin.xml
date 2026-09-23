@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<!-- CycloneDDS config for the Orin site of the split deployment (companion
+of cyclonedds_x86.xml — see that file for the distro-mix and unicast-peer
+rationale; this side points its peer at the x86 sim site). -->
+<CycloneDDS xmlns="https://cdds.io/config">
+  <Domain Id="any">
+    <General>
+      <!-- Companion of cyclonedds_x86.xml: pin the USB link on this side too
+           (the bench also has WiFi up; don't let cyclone pick arbitrarily).
+           l4tbr0 is the Jetson USB gadget bridge carrying 192.168.55.1. -->
+      <Interfaces>
+        <NetworkInterface name="l4tbr0"/>
+      </Interfaces>
+    </General>
+  </Domain>
+</CycloneDDS>

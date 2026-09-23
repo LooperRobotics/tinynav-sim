@@ -33,16 +33,18 @@ LINK_REMAPS = [
 def generate_launch_description():
     share = get_package_share_directory("tinynav_cpp")
     config = os.path.join(share, "config", "tinynav.yaml")
-    # Split-site DDS wiring (matches sim.launch.py, which runs the discovery
-    # server): UDPv4-only transports + server-based unicast discovery. The
-    # address points at the sim site — over the real USB/Ethernet link this
-    # is the peer's link IP.
+    # DDS: CycloneDDS with unicast peers (config/cyclonedds_x86.xml). The two
+    # sites run different ROS distros (Humble here, Jazzy on the Orin) — they
+    # must NOT share Fast DDS: Jazzy's rmw_fastrtps enables type namespacing,
+    # whose type identifiers never match Humble's (rmw_fastrtps#797 can even
+    # OOM the Humble side). No discovery server process; the peer is the
+    # Orin's USB link address.
     return LaunchDescription([
         DeclareLaunchArgument("params_file", default_value=config),
-        DeclareLaunchArgument("discovery_server", default_value="127.0.0.1:11811"),
-        SetEnvironmentVariable("FASTDDS_BUILTIN_TRANSPORTS", "UDPv4"),
-        SetEnvironmentVariable("ROS_DISCOVERY_SERVER",
-                               LaunchConfiguration("discovery_server")),
+        SetEnvironmentVariable("RMW_IMPLEMENTATION", "rmw_cyclonedds_cpp"),
+        SetEnvironmentVariable(
+            "CYCLONEDDS_URI",
+            "file://" + os.path.join(share, "config", "cyclonedds_x86.xml")),
         Node(
             package="tinynav_cpp",
             executable="tinynav_node",

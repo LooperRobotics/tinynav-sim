@@ -47,23 +47,32 @@ def world_name_of(world_sdf: str) -> str:
 
 
 def dds_env_args(context) -> list:
-    """Split-site DDS wiring: UDPv4-only builtin transports (the cross-
-    container rehearsal has separate /dev/shm namespaces — SHM locators get
-    announced but are unreachable, and the graph flaps; the real link is UDP
-    anyway) and server-based unicast discovery (multicast is unreliable on
-    wifi/point-to-point links, which is exactly what the real x86<->Orin
-    link is). The discovery server process runs HERE, on the sim site."""
+    """DDS wiring for the sim site. Default is CycloneDDS with unicast peers
+    (config/cyclonedds_x86.xml): the split link pairs Humble (here) with a
+    Jazzy Orin, and Fast DDS type namespacing (Jazzy default) makes the two
+    distros' DDS type identifiers unmatchable — same-vendor CycloneDDS on
+    both ends keeps them identical, and the USB point-to-point link runs on
+    explicit peers with no server process. dds:=fastdds keeps the legacy
+    UDPv4 + discovery-server wiring for single-distro rigs."""
+    if LaunchConfiguration("dds").perform(context) == "fastdds":
+        return [
+            SetEnvironmentVariable("FASTDDS_BUILTIN_TRANSPORTS", "UDPv4"),
+            SetEnvironmentVariable(
+                "ROS_DISCOVERY_SERVER", LaunchConfiguration("discovery_server").perform(context)),
+            ExecuteProcess(
+                # The fastdds CLI is a shebang-less shell wrapper (bash runs it
+                # via its ENOEXEC fallback; execvp does not) — call the python
+                # entry point directly.
+                cmd=["python3", "/opt/ros/humble/tools/fastdds/fastdds.py",
+                     "discovery", "-i", "0"],
+                name="discovery_server", output="screen"),
+        ]
     return [
-        SetEnvironmentVariable("FASTDDS_BUILTIN_TRANSPORTS", "UDPv4"),
+        SetEnvironmentVariable("RMW_IMPLEMENTATION", "rmw_cyclonedds_cpp"),
         SetEnvironmentVariable(
-            "ROS_DISCOVERY_SERVER", LaunchConfiguration("discovery_server").perform(context)),
-        ExecuteProcess(
-            # The fastdds CLI is a shebang-less shell wrapper (bash runs it
-            # via its ENOEXEC fallback; execvp does not) — call the python
-            # entry point directly.
-            cmd=["python3", "/opt/ros/humble/tools/fastdds/fastdds.py",
-                 "discovery", "-i", "0"],
-            name="discovery_server", output="screen"),
+            "CYCLONEDDS_URI",
+            "file://" + os.path.join(
+                WS_ROOT, "src", "tinynav_cpp", "config", "cyclonedds_x86.xml")),
     ]
 
 
@@ -92,6 +101,23 @@ def launch_setup(context, *args, **kwargs):
     x, y, z, yaw = SPAWN_POSES.get((world_name, robot), (0.0, 0.0, 0.0, 0.0))
 
     os.makedirs(os.path.join(WS_ROOT, "logs"), exist_ok=True)
+    # Trajectory follower command. remote_planning:=true (split rig): planning
+    # runs on the Orin and its trajectory crosses the link as
+    # /sim/trajectory_path — the bridge renames it so its own relay never
+    # self-matches — and the follower is remapped onto that name here.
+    control_cmd = [
+        "python3",
+        os.path.join(WS_ROOT, "reference/tinynav/platforms/simulator_control.py"),
+    ]
+    if LaunchConfiguration("remote_planning").perform(context) == "true":
+        control_cmd += ["--ros-args", "-r",
+                        "/planning/trajectory_path:=/sim/trajectory_path"]
+    # The follower imports tinynav.core.robot_specs from the reference
+    # snapshot (run_simulator.sh exports this into every window; launch must
+    # carry it on the process itself).
+    control_pp = os.path.join(WS_ROOT, "reference")
+    if "PYTHONPATH" in os.environ:
+        control_pp += ":" + os.environ["PYTHONPATH"]
     actions = [SetEnvironmentVariable("GDK_SCALE", "1")]
     actions += dds_env_args(context)
     actions += [
@@ -106,6 +132,10 @@ def launch_setup(context, *args, **kwargs):
         ExecuteProcess(cmd=
             ["python3", os.path.join(SIM_DIR, "scene", "gen_textures.py")],
             name="gen_textures", output="screen"),
+        ExecuteProcess(cmd=
+            ["rviz2", "-d", os.path.join(WS_ROOT, "docs", "vis.rviz")],
+            name="rviz", output="screen",
+            condition=IfCondition(LaunchConfiguration("rviz"))),
         TimerAction(period=2.0, actions=[
             ExecuteProcess(cmd=
                 ["ign", "gazebo", "-s", "-r", "--headless-rendering", "-v", "4",
@@ -134,9 +164,10 @@ def launch_setup(context, *args, **kwargs):
                 name="robot_spawn", output="screen"),
             # Trajectory follower: turns /planning/trajectory_path into
             # /cmd_vel (go2: the servo consumes it; lekiwi: diff-drive).
-            ExecuteProcess(cmd=
-                ["python3",
-                 os.path.join(WS_ROOT, "reference/tinynav/platforms/simulator_control.py")],
+            # remote_planning:=true (split rig): the follower is remapped onto
+            # /sim/trajectory_path — see control_cmd above.
+            ExecuteProcess(cmd=control_cmd,
+                additional_env={"PYTHONPATH": control_pp},
                 name="simulator_control", output="screen",
                 condition=IfCondition(LaunchConfiguration("control"))),
             ExecuteProcess(cmd=
@@ -178,7 +209,10 @@ def generate_launch_description():
         DeclareLaunchArgument("robot", default_value="go2"),
         DeclareLaunchArgument("control", default_value="true"),
         DeclareLaunchArgument("teleop", default_value="false"),
-        DeclareLaunchArgument("gui", default_value="false"),
+        DeclareLaunchArgument("gui", default_value="true"),
+        DeclareLaunchArgument("rviz", default_value="true"),
         DeclareLaunchArgument("discovery_server", default_value="127.0.0.1:11811"),
+        DeclareLaunchArgument("dds", default_value="cyclone"),
+        DeclareLaunchArgument("remote_planning", default_value="false"),
         OpaqueFunction(function=launch_setup),
     ])

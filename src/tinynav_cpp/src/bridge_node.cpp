@@ -35,6 +35,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include <nav_msgs/msg/odometry.hpp>
+#include <nav_msgs/msg/path.hpp>
 #include <sensor_msgs/msg/image.hpp>
 
 #include "tinynav_cpp/logging_setup.hpp"
@@ -87,6 +88,18 @@ class LooperBridgeNode : public rclcpp::Node {
                     [pub = odom_pubs_.back()](nav_msgs::msg::Odometry::ConstSharedPtr msg) {
                         pub->publish(*msg);
                     }));
+            } else if (spec.type == "Path") {
+                // Orin->x86 leg of the bench topology: planning runs beside
+                // the bridge, the trajectory follower sits on the sim site,
+                // so the trajectory must cross the link back (renamed to
+                // avoid same-name self-match on this node).
+                path_pubs_.push_back(create_publisher<nav_msgs::msg::Path>(
+                    spec.to, qos));
+                path_subs_.push_back(create_subscription<nav_msgs::msg::Path>(
+                    spec.from, qos,
+                    [pub = path_pubs_.back()](nav_msgs::msg::Path::ConstSharedPtr msg) {
+                        pub->publish(*msg);
+                    }));
             } else {
                 RCLCPP_FATAL(get_logger(), "relay entry %s: unsupported type %s",
                              spec.to.c_str(), spec.type.c_str());
@@ -106,6 +119,8 @@ class LooperBridgeNode : public rclcpp::Node {
     std::vector<rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr> image_subs_;
     std::vector<rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr> odom_pubs_;
     std::vector<rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr> odom_subs_;
+    std::vector<rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr> path_pubs_;
+    std::vector<rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr> path_subs_;
 };
 
 }  // namespace

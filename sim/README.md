@@ -18,29 +18,60 @@
   rviz 一个命令起齐，每窗口可看实时输出、`tee logs/*.log`。调试日常用它。
 - **`sim/launch/sim.launch.py`**（ros2 launch）：sim 层独立产品面——只含
   gz server/gui、spawn、gz bridge、camera_info、simulator_control（teleop
-  可选），**不含任何导航栈**，且自带 FastDDS discovery server。分机部署
-  （x86 跑 sim+perception，Orin 跑 bridge+三件）用它与
-  `tinynav_cpp/launch/{perception,orin_stack}.launch.py` 组合：
+  可选），**不含任何导航栈**。分机部署（x86 跑 sim+perception，Orin 跑
+  bridge+三件）用它与 `tinynav_cpp/launch/{perception,orin_stack}.launch.py`
+  组合。
+
+  **DDS**：两边默认 CycloneDDS（`dds:=cyclone`；launch 内置 export
+  `RMW_IMPLEMENTATION` + `CYCLONEDDS_URI=file://.../src/tinynav_cpp/config/
+  cyclonedds_x86.xml`，配置钉在 USB 链路网卡上）。两个站点 ROS 发行版不同
+  （x86 Humble / Orin Jazzy），不能共用 Fast DDS：Jazzy 默认开启 type
+  namespacing，类型标识与 Humble 永远对不上（rmw_fastrtps#797 还能把
+  Humble 侧 OOM）。`dds:=fastdds` 保留旧 UDPv4 + discovery server 接线，
+  仅用于单发行版环境。
 
   ```bash
-  # x86 站点（discovery server 归它管，11811）
-  ros2 launch sim/launch/sim.launch.py world:=sim/worlds/yard.sdf robot:=go2
-  ros2 launch tinynav_cpp perception.launch.py          # /slam/* 重映射出站
-  # Orin 站点（discovery_server 指向 x86 的链路 IP）
-  ros2 launch tinynav_cpp orin_stack.launch.py \
-      map_path:=/path/to/map_v2 discovery_server:=<x86链路IP>:11811
+  # ---- x86 站点（rig 容器 tinynav，仓库挂 /workspace/dm/tinynav-sim）----
+  docker start tinynav && docker exec -it tinynav bash
+
+  # 终端 1：sim 层（/clock 归它管）。remote_planning:=true 把跟随器重映射
+  #        到 /sim/trajectory_path，接 Orin 桥过来的轨迹；gui/rviz 默认起。
+  cd /workspace/dm/tinynav-sim && source /opt/ros/humble/setup.bash
+  ros2 launch sim/launch/sim.launch.py world:=sim/worlds/yard.sdf robot:=go2 \
+      remote_planning:=true
+
+  # 终端 2：perception（/slam/* 重映射进 camera-box 命名空间出站）
+  source install/setup.bash
+  ros2 launch tinynav_cpp perception.launch.py
+
+  # ---- Orin 站点（裸机 Jazzy，nvidia@192.168.55.1）----
+  sshpass -p nvidia ssh nvidia@192.168.55.1
+  source /home/nvidia/workspace/dm/nav_env.sh   # Jazzy + 工作区 + cyclonedds_orin.xml + DB
+  ros2 launch tinynav_cpp orin_stack.launch.py map_path:=/home/nvidia/workspace/dm/map_v2
   ```
 
-  跨机验证用数据面探针（ros2 CLI 在 Discovery Server 模式下全盲）：
-  `tools/probes/probe_first_msg.py`（订阅）与 `probe_pub_once.py`（发布）。
-  2026-09-20 两容器演练全链已通：四话题跨机 + 行驶验收 + reloc 位姿 3cm。
+  启动顺序：sim（时钟源）→ perception → Orin 栈（use_sim_time 吃跨链路
+  /clock）。改过代码或 config 后先 `colcon build --packages-select
+  tinynav_cpp`——launch 读的是 `install/` 下的拷贝，Orin 侧同理。想要
+  per-node 日志就在两侧 export `TINYNAV_DB_PATH`（Orin 的 nav_env.sh 已带）。
+  收摊：x86 `bash sim/kill_sim.sh`（单独一条跑）；Orin
+  `pkill -f "[o]rin_stack"`（方括号防 pkill 匹配到自己的命令行）。
+
+  起来后确认：x86 `bash sim/dog_state.sh --slam`（gz 真值 + yaw + 是否在
+  建图轨迹包围盒内）；链路用数据面探针
+  `python3 tools/probes/probe_first_msg.py /camera/camera/slam/odometry_visual
+  Odometry`。Cyclone 模式下 ros2 CLI 正常可用（不再是 discovery-server
+  全盲状态）；但容器里手动跑 CLI/探针要先手动 export 与 launch 相同的两个
+  DDS 变量——镜像 ENV 烤进去的 CYCLONEDDS_URI 指向不存在的文件，必须覆盖。
+  2026-09-20 两容器演练全链已通：四话题跨机 + 行驶验收 + reloc 位姿 3cm；
+  2026-09-21 真机 Orin（裸机 Jazzy）同链路 C3 行驶验收通过。
 
 ## 布局
 
 ```
 sim/
 ├── run_simulator.sh   # 启动器：每组件一个 tmux 窗口（单机开发用）
-├── launch/sim.launch.py  # sim 层独立 launch（分机部署 + discovery server）
+├── launch/sim.launch.py  # sim 层独立 launch（分机部署；dds:=cyclone 默认，DDS 环境内置）
 ├── fastdds_udp.xml    # （备用）FastDDS 2.6 XML：UDPv4-only + 白名单
 ├── kill_sim.sh        # 全停（启动器每次先跑它，保证不串上一次）
 ├── worlds/            # empty / yard / depot / factory .sdf —— 纯环境，不含机器人
@@ -49,10 +80,12 @@ sim/
                        # camera_info_publisher / gen_textures / config / models
 ```
 
-> fastdds_udp.xml 曾在演练中试过（transport_descriptors + 白名单写法），
-> 最终方案用环境变量 `FASTDDS_BUILTIN_TRANSPORTS=UDPv4` + 
-> `ROS_DISCOVERY_SERVER`（launch 内置），此文件仅留作白名单/缓冲区调优的
-> 起点。注意 2.6 的 XML 解析器不吃 xmlns。
+> fastdds_udp.xml 曾在两容器演练中试过（transport_descriptors + 白名单写法）。
+> 分机链路的最终方案是两边 CycloneDDS（`src/tinynav_cpp/config/
+> cyclonedds_{x86,orin}.xml`：钉 USB 网卡 + 组播，无 server 进程）；此文件
+> 仅在 `dds:=fastdds`（`FASTDDS_BUILTIN_TRANSPORTS=UDPv4` +
+> `ROS_DISCOVERY_SERVER`）的单发行版场景下作为白名单/缓冲区调优起点。
+> 注意 Humble 的 Fast DDS 2.6 XML 解析器不吃 xmlns。
 
 ## 怎么跑
 
@@ -70,6 +103,10 @@ bash sim/run_simulator.sh --auto l_corridor  # 剧本场景
 bash sim/run_simulator.sh --stack sensor     # 只起传感器面（pilot 拥有其余部分）
 tmux attach -t tinynav_sim                   # 看各窗口
 ```
+
+日常更常用的是常驻 rig 容器 `tinynav`（`docker start tinynav && docker exec
+-it tinynav bash`），仓库挂载在 `/workspace/dm/tinynav-sim`（不是 /ws）；
+上面 `docker run --rm` 是一次性临时容器（/ws）。两条路径二选一，别混用。
 
 PYTHONPATH 不用手配：脚本头部已 `export PYTHONPATH="$WS_ROOT/reference:$PYTHONPATH"`，
 镜像 ENV 里本来就有 `/opt/venv/lib/python3.10/site-packages` + `/3rdparty/gtsam/build/python`

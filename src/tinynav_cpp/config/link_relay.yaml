@@ -17,3 +17,8 @@ relay:
   # (KeepLast(1)) — the relay must match it (the fleet bridge also publishes
   # every /slam/* topic with its reliable sensor_qos).
   - {type: Image, from: /camera/camera/slam/depth, to: /slam/depth, depth: 5, reliable: true}
+  # Orin->x86 leg, bench topology only: planning runs beside this bridge, the
+  # trajectory follower sits on the sim site. Renamed (/sim/...) so this node
+  # never matches its own publication; the sim site remaps it back for the
+  # follower (sim.launch.py remote_planning:=true).
+  - {type: Path, from: /planning/trajectory_path, to: /sim/trajectory_path, depth: 10, reliable: true}

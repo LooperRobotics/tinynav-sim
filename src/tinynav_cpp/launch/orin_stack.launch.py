@@ -23,21 +23,19 @@ def generate_launch_description():
     share = get_package_share_directory("tinynav_cpp")
     config = os.path.join(share, "config", "tinynav.yaml")
     relay = os.path.join(share, "config", "link_relay.yaml")
-    # Split-site DDS wiring (the discovery server runs on the sim site):
-    # UDPv4-only transports + server-based unicast discovery. The real link
-    # (USB/Ethernet point-to-point) has no reliable multicast, and the
-    # cross-container rehearsal has separate /dev/shm namespaces that make
-    # the SHM builtin transport announce unreachable locators. On the real
-    # link, pass discovery_server:=<sim site's link IP>:11811.
+    # DDS: CycloneDDS with unicast peers (config/cyclonedds_orin.xml) — the
+    # peer is the x86 sim site's USB link address. Mandatory here: this site
+    # runs Jazzy while the sim site runs Humble, and Fast DDS type namespacing
+    # (Jazzy default) makes the two distros' type identifiers unmatchable.
     actions = [
         DeclareLaunchArgument("params_file", default_value=config),
         DeclareLaunchArgument("map_path", default_value=""),
         DeclareLaunchArgument(
             "components", default_value="imu,mapping,planning"),
-        DeclareLaunchArgument("discovery_server", default_value="127.0.0.1:11811"),
-        SetEnvironmentVariable("FASTDDS_BUILTIN_TRANSPORTS", "UDPv4"),
-        SetEnvironmentVariable("ROS_DISCOVERY_SERVER",
-                               LaunchConfiguration("discovery_server")),
+        SetEnvironmentVariable("RMW_IMPLEMENTATION", "rmw_cyclonedds_cpp"),
+        SetEnvironmentVariable(
+            "CYCLONEDDS_URI",
+            "file://" + os.path.join(share, "config", "cyclonedds_orin.xml")),
         # Launch-scope env: the stack node reads it in main(); the bridge
         # ignores it.
         SetEnvironmentVariable("TINYNAV_COMPONENTS",
