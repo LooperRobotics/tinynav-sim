@@ -9,15 +9,23 @@
 //  - Publishers/topics/QoS and the sync_callback flow follow the Python
 //    section by section; see the per-block comments.
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <rclcpp/rclcpp.hpp>
 
+// Jazzy's cv_bridge 4.x renamed the header to .hpp (Humble only has .h).
+#if __has_include(<cv_bridge/cv_bridge.hpp>)
+#include <cv_bridge/cv_bridge.hpp>
+#else
 #include <cv_bridge/cv_bridge.h>
+#endif
 #include <message_filters/subscriber.h>
 #include <message_filters/synchronizer.h>
 #include <message_filters/sync_policies/exact_time.h>
@@ -626,6 +634,36 @@ class PlanningComponent : public rclcpp::Node {
     }
 
     // --- publishers --------------------------------------------------------
+    // Publish profiling (diagnostic): times each publish() (serialization +
+    // DDS/intra-proc write) and dumps n/avg/max per topic every 5 s of
+    // steady-clock. All publishes run on the executor thread — no lock needed.
+    struct PublishStat {
+        int count = 0;
+        double total_ms = 0.0;
+        double max_ms = 0.0;
+    };
+
+    void profile_publish(const char* topic, const std::function<void()>& publish_fn) {
+        const auto t0 = std::chrono::steady_clock::now();
+        publish_fn();
+        const auto t1 = std::chrono::steady_clock::now();
+        PublishStat& stat = publish_stats_[topic];
+        ++stat.count;
+        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        stat.total_ms += ms;
+        stat.max_ms = std::max(stat.max_ms, ms);
+        if (std::chrono::duration<double>(t1 - profile_window_start_).count() >= 5.0) {
+            for (const auto& [name, st] : publish_stats_) {
+                RCLCPP_INFO(get_logger(),
+                            "[publish-profile] %-28s n=%-5d avg=%7.2fms max=%8.2fms",
+                            name.c_str(), st.count,
+                            st.count > 0 ? st.total_ms / st.count : 0.0, st.max_ms);
+            }
+            publish_stats_.clear();
+            profile_window_start_ = t1;
+        }
+    }
+
     // Decimation is load-bearing: cmd_vel_control reads dt off this Path
     // (PATH_POSE_STRIDE = 10).
     void publish_selected_path(const planning::TrajectorySet& trajectories, int index,
@@ -646,7 +684,9 @@ class PlanningComponent : public rclcpp::Node {
             stamped.pose.orientation.w = pose[6];
             path.poses.push_back(stamped);
         }
-        path_pub_->publish(std::make_unique<nav_msgs::msg::Path>(std::move(path)));
+        profile_publish("trajectory_path", [&] {
+            path_pub_->publish(std::make_unique<nav_msgs::msg::Path>(std::move(path)));
+        });
     }
 
     void publish_footprint(const Eigen::Matrix4d& T, const builtin_interfaces::msg::Time& stamp) {
@@ -676,7 +716,9 @@ class PlanningComponent : public rclcpp::Node {
                 cloud.points.push_back(pt);
             }
         }
-        footprint_pub_->publish(std::make_unique<sensor_msgs::msg::PointCloud>(std::move(cloud)));
+        profile_publish("footprint", [&] {
+            footprint_pub_->publish(std::make_unique<sensor_msgs::msg::PointCloud>(std::move(cloud)));
+        });
     }
 
     void publish_obstacle_mask(const planning::Mask2D& mask, const builtin_interfaces::msg::Time& stamp) {
@@ -699,7 +741,10 @@ class PlanningComponent : public rclcpp::Node {
                 grid.data[idx++] = mask(r, c) ? 100 : 0;
             }
         }
-        obstacle_mask_pub_->publish(std::make_unique<nav_msgs::msg::OccupancyGrid>(std::move(grid)));
+        profile_publish("obstacle_mask", [&] {
+            obstacle_mask_pub_->publish(
+                std::make_unique<nav_msgs::msg::OccupancyGrid>(std::move(grid)));
+        });
     }
 
     void publish_height_map(const Eigen::ArrayXXf& esdf_map, const std_msgs::msg::Header& header) {
@@ -714,7 +759,7 @@ class PlanningComponent : public rclcpp::Node {
         cv::Mat color;
         cv::applyColorMap(normalized, color, cv::COLORMAP_JET);
         auto msg = cv_bridge::CvImage(header, "bgr8", color).toImageMsg();
-        height_map_pub_->publish(*msg);
+        profile_publish("height_map", [&] { height_map_pub_->publish(*msg); });
     }
 
     void publish_2d_occupancy_grid(const Eigen::ArrayXXf& esdf_map,
@@ -745,7 +790,10 @@ class PlanningComponent : public rclcpp::Node {
                 grid.data[idx++] = value;
             }
         }
-        occupancy_grid_pub_->publish(std::make_unique<nav_msgs::msg::OccupancyGrid>(std::move(grid)));
+        profile_publish("occupancy_grid", [&] {
+            occupancy_grid_pub_->publish(
+                std::make_unique<nav_msgs::msg::OccupancyGrid>(std::move(grid)));
+        });
     }
 
     void publish_3d_occupancy_cloud() {
@@ -779,7 +827,10 @@ class PlanningComponent : public rclcpp::Node {
             *iy = p.y(); ++iy;
             *iz = p.z(); ++iz;
         }
-        occupancy_cloud_pub_->publish(std::make_unique<sensor_msgs::msg::PointCloud2>(std::move(cloud)));
+        profile_publish("occupied_voxels", [&] {
+            occupancy_cloud_pub_->publish(
+                std::make_unique<sensor_msgs::msg::PointCloud2>(std::move(cloud)));
+        });
     }
 
     void publish_3d_occupancy_cloud_with_esdf(const Eigen::ArrayXXf& esdf_map) {
@@ -829,8 +880,10 @@ class PlanningComponent : public rclcpp::Node {
                 *irgb = rgb; ++irgb;
             }
         }
-        occupancy_cloud_esdf_pub_->publish(
-            std::make_unique<sensor_msgs::msg::PointCloud2>(std::move(cloud)));
+        profile_publish("occupied_voxels_with_esdf", [&] {
+            occupancy_cloud_esdf_pub_->publish(
+                std::make_unique<sensor_msgs::msg::PointCloud2>(std::move(cloud)));
+        });
     }
 
     // --- small adapters ----------------------------------------------------
@@ -910,6 +963,11 @@ class PlanningComponent : public rclcpp::Node {
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr occupancy_cloud_pub_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr occupancy_cloud_esdf_pub_;
     rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr occupancy_grid_pub_;
+
+    // publish profiling state (see profile_publish)
+    std::unordered_map<std::string, PublishStat> publish_stats_;
+    std::chrono::steady_clock::time_point profile_window_start_ =
+        std::chrono::steady_clock::now();
     rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr camerainfo_sub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr target_sub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr poi_change_sub_;
