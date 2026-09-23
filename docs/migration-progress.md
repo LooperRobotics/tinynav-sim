@@ -554,3 +554,47 @@ docker run --rm --gpus all --network host -v "$PWD":/ws -w /ws \
   uniflexai/tinynav:latest bash sim/run_simulator.sh --robot go2 --world factory
 docker run ... bash sim/run_simulator.sh --stack cpp --robot go2 --world empty
 ```
+
+## 2026-09-23 关键帧降密 + map_v2 lazy + LiveCapture 落盘 + 深度 Z16
+
+背景：艺尚狗实测 8 图 110G（单图 22G = 9587 帧 × f32 深度 13G + SP 特征 4.9G），
+关键帧阈值 0.03m≈逐帧存；map_v2 eager 物化在艺尚级真图上 ~18G RSS 必 OOM；
+组件自身帧内存 map 随任务时长无界增长（nav_temp 的"内存替代"偏离了 python 语义）。
+
+- **关键帧阈值** `perception_component` 0.1m/0.1° → **0.3m/10°**（3s 超时保留）。
+  yard 实测行驶 ~1Hz（旧 ~6Hz）。狗上 looper_bridge 的 `--keyframe-translation`
+  默认 0.03 也要同步改（现场侧待办）。
+- **map_v2 lazy**：`mapping/mapped_npy.hpp`（只读 mmap npy，MADV_RANDOM）；
+  MapV2 eager 只留 timestamps/poses/VLAD 索引，depth/features 走
+  `get_depth/get_features` 零拷贝行视图。加载艺尚级图从 ~18G RSS → 近基线。
+- **LiveCapture**（`mapping/live_capture.{hpp,cpp}`）：自身帧落盘，python
+  nav_temp_db 语义对齐——开即清空（scratch）、embeddings 留 RAM（find_loop
+  每帧扫描）、depth/features 列式追加按候选读。布局 = v2 文件集增量写
+  （128B 固定 npy 头 open 预写/close 原地补 shape），**close 后目录 + poses +
+  VLAD 就是合法 v2 子集**（测试经 load_map_v2 回读锁死该性质）。接线：组件
+  `features_`/`depth_of_` 内存 map 删除，append 失败的帧不参与回环（不索
+  embedding）；`live_capture_dir` 参数默认 `nav_temp_v2`。
+- **深度 Z16**：v2 `depth_images.npy` 改 **u16 毫米**（导出器 + LiveCapture 一致；
+  reader 兼容旧 f4），MapV2/LiveCapture get_depth 按候选帧转回 f32 米。
+  狗上 13G depths.db 同源改造后 ~6.5G。**夹具 expected 仍为 f32 米真值**，
+  测试比较放行 ±0.5mm 量化。
+- **测试 72/72**：新增 live_capture 两个（RSS 平坦 + u16 往返 ±0.5mm + close
+  目录 load_map_v2 读通；shape 突变拒帧不停会话）；压力图改 4000 帧 u16 2.6G。
+- **e2e（yard 单机 cpp --map u16 图）**：reloc 锁定、两趟往返 140m 到点精确、
+  append 0 失败、RSS 737→854→797MB（自身帧在盘，内存零增长）、live 目录
+  130M/55 帧。坑：close 后 1 维 npy shape 曾写成 `(N,,)`（C++ 解析宽容、
+  numpy 拒读，破坏 v2 互操作）已修——**改格式后必须用 numpy 回读验证**。
+- 环境坑：镜像 ENV 烤死的 `CYCLONEDDS_URI=/tinynav/scripts/cyclone_dds_
+  localhost.xml` 在 rig 容器不存在 → 所有 Cyclone 节点建域即死；run_simulator.sh
+  已统一覆盖为空（分机 launch 自带 URI 不受影响）。
+
+### 2026-09-23 补：VLAD 检索索引 f64→f32（8G Orin Nano 预算）
+
+狗实为 Orin Nano 8G，f64 索引同密度 1.9G 不可接受。`MapV2::vlad_descriptors`
+改 **f32 行主序**（`VladIndex`，npy f32 直接 memcpy；f8 输入降精度兼容），
+查询向量一次性 cast f32 后点积（f32 带宽减半）。`vlad_centres` 保持 f64
+（32x768=200KB 无关紧要，compute_vlad 库零改动）。python 本来就是 f32——
+C++ 的 f64 反而是保真度偏离，此改同时修正。加载日志新增索引 MB。
+测试 72/72；e2e：`VLAD 92x24576 f32 (9MB)`、到点 4.48/4.5、reloc 锁定零失败。
+8G 预算（降密后 959 帧）：索引 94MB + 位姿/杂项 ~30MB + TRT 引擎与 VIO 若干百 MB
+——eager 索引无压力；同密度 9587 帧则索引 943MB，仍以降密为先。
