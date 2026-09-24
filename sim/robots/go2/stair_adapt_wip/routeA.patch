@@ -1,0 +1,320 @@
+diff --git a/sim/robots/go2/go2_controller.py b/sim/robots/go2/go2_controller.py
+index 1469a6c..06fe167 100644
+--- a/sim/robots/go2/go2_controller.py
++++ b/sim/robots/go2/go2_controller.py
+@@ -15,6 +15,7 @@ import rclpy
+ from rclpy.node import Node
+ from rclpy.time import Time
+ from geometry_msgs.msg import Twist
++from sensor_msgs.msg import JointState
+ from std_msgs.msg import Float64MultiArray
+ 
+ RATE = 60  # Hz control loop (the trot math steps at time_step=0.02 s below)
+@@ -135,11 +136,198 @@ class InverseKinematics:
+         # joint angles in radians for FR, FL, RR, RL
+         return angles
+ 
++    def foot_position_body(self, angles, leg_index):
++        """Exact FK: (hip abduction, thigh, calf) angles -> foot (x, y, z) in
++        the body frame (level body, world yaw irrelevant for support height).
++        Algebraic inverse of inverse_kinematics() — fk_check.py asserts the
++        round trip, do not edit one without the other.
++
++        angles = (theta1, theta3, theta4) as produced by inverse_kinematics:
++        theta1 in the xy plane, theta3/theta4 the knee-chain pair in the
++        (F, z) plane with F = sqrt(x^2+y^2-l2^2).
++        """
++        t1, t3, t4 = angles
++        l1, l2, l3, l4 = self.l1, self.l2, self.l3, self.l4
++
++        # knee chain: from D = (H^2-l3^2-l4^2)/(2 l3 l4) and the IK branch
++        # theta4 = -atan2(sqrt(1-D^2), D):  cos(theta4) = D
++        h = math.sqrt(l3**2 + l4**2 + 2 * l3 * l4 * math.cos(t4))
++        phi = t3 + math.atan2(l4 * math.sin(t4), l3 + l4 * math.cos(t4))
++        g = h * math.cos(phi)
++        z = h * math.sin(phi)
++        f = g + l1
++
++        # planar pair: theta1 = -atan2(y, x) - atan2(F, l2*(-1)^leg_index),
++        # and F = sqrt(x^2+y^2-l2^2)  =>  |(x, y)| = sqrt(F^2 + l2^2)
++        s = l2 * (-1) ** leg_index
++        psi = -t1 - math.atan2(f, s)
++        r_xy = math.sqrt(f**2 + l2**2)
++        x = r_xy * math.cos(psi)
++        y = r_xy * math.sin(psi)
++
++        # hip-local frame -> body frame (same per-leg transform the IK
++        # inverts; body pose is identity — support estimation only needs the
++        # physical body frame, not the commanded one)
++        if leg_index == 0:
++            t = homog_transform(+0.5 * self.bodyLength, -0.5 * self.bodyWidth, 0, math.pi / 2, -math.pi / 2, 0)
++        elif leg_index == 1:
++            t = homog_transform(+0.5 * self.bodyLength, +0.5 * self.bodyWidth, 0, math.pi / 2, -math.pi / 2, 0)
++        elif leg_index == 2:
++            t = homog_transform(-0.5 * self.bodyLength, -0.5 * self.bodyWidth, 0, math.pi / 2, -math.pi / 2, 0)
++        else:
++            t = homog_transform(-0.5 * self.bodyLength, +0.5 * self.bodyWidth, 0, math.pi / 2, -math.pi / 2, 0)
++        p = np.dot(t, np.array([x, y, z, 1.0]))
++        return p[:3]
++
+ 
+ # ---------------------------------------------------------------------------
+-# gait state
++# stair adaptation (Route A, proprioceptive "blind" climbing)
+ # ---------------------------------------------------------------------------
+ 
++# knobs (kept plain so fk_check.py can exercise the same numbers)
++STAIR_PROBE_BIAS = 0.02     # constant front-paw probe raise while driving (m)
++STAIR_BIAS_MAX = 0.18       # reflex escalation ceiling (covers 15 cm risers + clearance)
++STAIR_BIAS_STEP = 0.02      # per-escalation raise (m)
++STAIR_BLOCK_TICKS = 5       # blocked ticks on one leg before escalating
++STAIR_BLOCK_MARGIN = 0.02   # commanded-above-actual z that counts as blocked (m)
++STAIR_DECAY_TICKS = 150     # ~3 s without evidence before the bias decays
++STAIR_PITCH_K = 1.2         # rad per m of front/rear support difference
++STAIR_PITCH_MAX = 0.17      # 10 deg clamp
++STAIR_PITCH_RATE = 0.0018   # rad per 20 ms tick (~5 deg/s)
++STAIR_PITCH_DEADBAND = 0.015
++STAIR_CLIMB_ENTER = 0.02    # front/rear diff (m) that flags climbing
++STAIR_CLIMB_EXIT_TICKS = 100
++STAIR_SPEED_GATE = 0.02     # vx ceiling while climbing (m/s)
++STAIR_SWING_LIFT = 0.14     # the trot's z_leg_lift (sets the apex headroom)
++STAIR_APEX_MAX = 0.05       # swing apex body-frame z ceiling (leg-fold limit)
++
++
++class SupportEstimator:
++    """Support-surface tracking from actual joint angles, plus the blocked-paw
++    reflex that discovers each riser.
++
++    All outputs are additive corrections on top of the legacy gait:
++      swing_z_bias  per-leg raise of the swing touchdown height — on flat it
++                    is the small front probe (STAIR_PROBE_BIAS), on stairs it
++                    grows to the measured/estimated riser;
++      pitch_cmd     commanded body pitch (nose-up on ascent) fed through
++                    state.body_local_orientation;
++      climbing      gates the vx ceiling.
++
++    With no joint_states yet, or on flat ground, everything degrades to the
++    legacy behavior (bias = probe only for front legs, pitch = 0).
++    """
++
++    def __init__(self, ik, default_height):
++        self.ik = ik
++        self.h_nom = default_height                # positive magnitude
++        self.angles = [None] * 4                   # (t1, t3, t4) per leg
++        self.foot_z = [-default_height] * 4        # body-frame foot z (negative)
++        self.ground_ref = -default_height          # median stance support z
++        self.front_support = -default_height
++        self.rear_support = -default_height
++        self.swing_biases = np.zeros(4)
++        self.step_bias = 0.0                       # reflex-escalated rise estimate
++        self.pitch_cmd = 0.0
++        self.block_counters = [0, 0, 0, 0]
++        self.last_evidence = -10 ** 9
++        self.climb_counter = 0
++        self.climbing = False
++
++    # gait leg order FR, FL, RR, RL -> urdf side prefix; joint_states arrives
++    # in a scrambled registration order, so map by NAME, never by index
++    LEG_SIDES = ("rf", "lf", "rh", "lh")
++
++    def on_joint_states(self, msg):
++        # actual encoder positions (gz physics feedback), not commanded ones
++        if len(msg.position) < 12 or len(msg.name) < 12:
++            return
++        idx = {name: i for i, name in enumerate(msg.name)}
++        for leg, side in enumerate(self.LEG_SIDES):
++            try:
++                self.angles[leg] = (
++                    msg.position[idx[side + "_hip_joint"]],
++                    msg.position[idx[side + "_upper_leg_joint"]],
++                    msg.position[idx[side + "_lower_leg_joint"]])
++            except KeyError:
++                return
++
++    def update(self, state, command, contact_modes):
++        ticks = state.ticks
++        commanded_z = state.foot_locations[2]
++
++        # FK the actual leg configuration (nominal fallback until the first
++        # joint_states arrives — corrections stay at legacy values)
++        for leg in range(4):
++            if self.angles[leg] is not None:
++                self.foot_z[leg] = self.ik.foot_position_body(self.angles[leg], leg)[2]
++
++        stance = [leg for leg in range(4) if contact_modes[leg] == 1]
++        stance = stance if stance else list(range(4))
++        self.ground_ref = float(np.median([self.foot_z[leg] for leg in stance]))
++        front = [self.foot_z[leg] for leg in (0, 1) if contact_modes[leg] == 1]
++        rear = [self.foot_z[leg] for leg in (2, 3) if contact_modes[leg] == 1]
++        self.front_support = float(np.median(front)) if front else self.ground_ref
++        self.rear_support = float(np.median(rear)) if rear else self.ground_ref
++
++        # blocked-paw reflex: a swinging paw whose commanded target sits
++        # STAIR_BLOCK_MARGIN above the FK position for STAIR_BLOCK_TICKS ticks
++        # is pressing a riser face — raise the shared rise estimate
++        escalated = False
++        for leg in range(4):
++            if contact_modes[leg] == 0 and self.angles[leg] is not None:
++                blocked = commanded_z[leg] - self.foot_z[leg]
++                if blocked > STAIR_BLOCK_MARGIN:
++                    self.block_counters[leg] += 1
++                    if self.block_counters[leg] >= STAIR_BLOCK_TICKS:
++                        self.step_bias = min(self.step_bias + STAIR_BIAS_STEP, STAIR_BIAS_MAX)
++                        self.block_counters = [0, 0, 0, 0]
++                        self.last_evidence = ticks
++                        escalated = True
++                        break
++                else:
++                    self.block_counters[leg] = 0
++        if not escalated and ticks - self.last_evidence > STAIR_DECAY_TICKS \
++                and self.step_bias > 0.0 and ticks % 10 == 0:
++            self.step_bias = max(0.0, self.step_bias - 0.01)
++
++        # per-leg swing bias: probe on the front pair while driving (flat-safe,
++        # escalates via the reflex); once a rise is discovered every leg gets
++        # it — rear paws must also land on the raised tread. Capped so the
++        # swing apex (ground_ref + lift + bias) never crosses the body plane
++        # and saturates the IK.
++        forward = abs(command.velocity[0]) > 0.005 or abs(command.velocity[1]) > 0.005
++        base_bias = self.step_bias if self.step_bias > 0.0 else (
++            STAIR_PROBE_BIAS if forward else 0.0)
++        # apex = robot_height + lift + bias must stay under the fold limit
++        apex_cap = max(0.0, STAIR_APEX_MAX - (-self.h_nom + STAIR_SWING_LIFT))
++        applied = min(base_bias, apex_cap)
++        for leg in range(4):
++            self.swing_biases[leg] = applied if (leg in (0, 1) or self.step_bias > 0.0) else 0.0
++
++        # pitch: nose into the ascent, rate-limited, deadbanded, clamped
++        diff = self.front_support - self.rear_support
++        if abs(diff) > STAIR_PITCH_DEADBAND:
++            target = max(-STAIR_PITCH_MAX, min(STAIR_PITCH_MAX, STAIR_PITCH_K * diff))
++        else:
++            target = 0.0
++        step = max(-STAIR_PITCH_RATE, min(STAIR_PITCH_RATE, target - self.pitch_cmd))
++        self.pitch_cmd += step
++
++        # climbing flag with exit hysteresis (gates the vx ceiling)
++        climbing_now = self.climbing or self.step_bias > 0.02 or diff > STAIR_CLIMB_ENTER
++        if climbing_now:
++            self.climb_counter = STAIR_CLIMB_EXIT_TICKS
++            self.climbing = True
++        else:
++            self.climb_counter -= 1
++            if self.climb_counter <= 0:
++                self.climbing = False
++
++    def speed_gate(self, vx):
++        return min(vx, STAIR_SPEED_GATE) if self.climbing else vx
++
++
+ class State:
+     def __init__(self, default_height):
+         self.velocity = np.array([0.0, 0.0])
+@@ -151,6 +339,11 @@ class State:
+         self.imu_roll = 0.0
+         self.imu_pitch = 0.0
+         self.ticks = 0
++        # stair adaptation (Route A): per-leg additive swing-z raise plus a
++        # commanded body pitch. Kept at zero unless SupportEstimator writes
++        # them — zeros reproduce the legacy gait bit-for-bit.
++        self.swing_z_bias = np.zeros(4)
++        self.pitch_cmd = 0.0
+ 
+ 
+ class Command:
+@@ -300,7 +493,10 @@ class TrotSwingController:
+         velocity = (touchdown_location - foot_location) / float(time_left) * np.array([1, 1, 0])
+ 
+         delta_foot_location = velocity * self.time_step
+-        z_vector = np.array([0, 0, swing_height_ + command.robot_height])
++        # stair adaptation rides in as an additive per-leg bias; the zero
++        # vector reproduces the legacy trajectory exactly (fk_check T3)
++        z_vector = np.array([0, 0, swing_height_ + command.robot_height
++                             + state.swing_z_bias[leg_index]])
+         return foot_location * np.array([1, 1, 0]) + z_vector + delta_foot_location
+ 
+ 
+@@ -392,6 +588,14 @@ class TrotGaitController(GaitController):
+                 rot = rotxyz(-compensation[0], -compensation[1], 0)
+                 new_foot_locations = np.matmul(rot, new_foot_locations)
+ 
++            # stair adaptation: commanded nose-up pitch — rotate the foot
++            # targets in the body frame so front targets drop (front legs
++            # extend) and rear targets rise (rear legs fold). Zero pitch skips
++            # the matmul entirely (bit-exact legacy).
++            if state.pitch_cmd != 0.0:
++                new_foot_locations = np.matmul(roty(state.pitch_cmd),
++                                               new_foot_locations)
++
+             state.ticks += 1
+             return new_foot_locations
+         else:
+@@ -437,6 +641,18 @@ class Go2Controller(Node):
+                                        swing_time=0.18, time_step=0.02, use_imu=True)
+         self.trot.pid_controller.reset()
+ 
++        # stair adaptation (Route A): proprioceptive support tracking. Off by
++        # default until the flat-regression pass signs off; False = the
++        # estimator is never updated and every correction stays zero. Live
++        # tunable via ros2 param set (no restart).
++        self.declare_parameter("stair_adapt", False)
++        self.stair_adapt = self.get_parameter("stair_adapt").value
++        self.add_on_set_parameters_callback(self._on_param)
++        self.estimator = SupportEstimator(self.inverseKinematics, 0.25)
++        self.stair_debug_publisher = self.create_publisher(
++            Float64MultiArray, "stair_debug", 10)
++        self.debug_tick = 0
++
+         self.joint_command_publisher = self.create_publisher(
+             Float64MultiArray, "joint_group_controller/commands", 10)
+ 
+@@ -444,9 +660,20 @@ class Go2Controller(Node):
+         # velocity arrives as /cmd_vel (absolute) and reaches this node only
+         # through the PI servo's namespaced output
+         self.create_subscription(Twist, "cmd_vel", self.on_cmd_vel, 10)
++        self.create_subscription(JointState, "joint_states", self.estimator.on_joint_states, 10)
+ 
+         self.timer = self.create_timer(1.0 / RATE, self.control_loop)
+ 
++    def _on_param(self, params):
++        from rcl_interfaces.msg import SetParametersResult
++        for p in params:
++            if p.name == "stair_adapt":
++                self.stair_adapt = p.value
++                if not p.value:
++                    self.state.swing_z_bias[:] = 0.0
++                    self.state.pitch_cmd = 0.0
++        return SetParametersResult(successful=True)
++
+     def on_cmd_vel(self, msg):
+         self.command.velocity = np.array([
+             min(max(msg.linear.x, -MAX_X_VELOCITY), MAX_X_VELOCITY),
+@@ -460,8 +687,28 @@ class Go2Controller(Node):
+         ])
+ 
+     def control_loop(self):
++        # stair adaptation: update corrections from the last tick's commands
++        # and the actual joint angles, then hand them to the gait through the
++        # additive state fields. stair_adapt=False leaves every field at its
++        # legacy value (zeros).
++        if self.stair_adapt:
++            contact_modes = self.trot.contacts(self.state.ticks)
++            self.estimator.update(self.state, self.command, contact_modes)
++            self.state.swing_z_bias[:] = self.estimator.swing_biases
++            self.state.pitch_cmd = self.estimator.pitch_cmd
++            self.command.velocity[0] = self.estimator.speed_gate(self.command.velocity[0])
++
+         leg_positions = self.trot.run(self.state, self.command)
+ 
++        # observability for the gait verification runs (6 Hz)
++        self.debug_tick += 1
++        if self.debug_tick % 10 == 0:
++            e = self.estimator
++            dbg = Float64MultiArray()
++            dbg.data = [e.step_bias, e.pitch_cmd, float(e.climbing),
++                        e.front_support, e.rear_support, e.ground_ref]
++            self.stair_debug_publisher.publish(dbg)
++
+         dx, dy, dz = self.state.body_local_position
+         roll, pitch, yaw = self.state.body_local_orientation
+ 

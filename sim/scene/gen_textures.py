@@ -71,14 +71,38 @@ def floor_texture(rng):
     return np.clip(img, 0, 1)
 
 
+def stair_texture(rng):
+    """Concrete step tread: lighter than the floor, a dark nosing band plus a
+    thin white painted line along one edge so each step front shows a
+    high-contrast corner (SLAM feature on the edge the dog steps over)."""
+    img = np.zeros((SIZE, SIZE, 3), np.float32)
+    img[:] = 0.58
+    n = noise(rng, 8, 0.07) + noise(rng, 64, 0.035) + noise(rng, 512, 0.018)
+    img += n[..., None]
+    step = SIZE // 4
+    for i in range(1, 4):  # faint trowel arcs
+        cv2.ellipse(img, (SIZE // 2, SIZE // 2), (i * step, i * step // 2),
+                    float(rng.uniform(0, 180)), 0, 360, (0.52, 0.52, 0.52), 2)
+    band = SIZE // 8
+    img[SIZE - band:, :] *= 0.62                      # dark nosing band (one edge)
+    cv2.line(img, (0, SIZE - band - 6), (SIZE, SIZE - band - 6), (0.92, 0.92, 0.9), 4)
+    for _ in range(8):  # scuffs
+        x, y = int(rng.integers(0, SIZE)), int(rng.integers(0, SIZE))
+        axes = (int(rng.integers(20, 70)), int(rng.integers(6, 22)))
+        cv2.ellipse(img, (x, y), axes, float(rng.uniform(0, 180)), 0, 360, (0.47, 0.47, 0.47), -1)
+    img = cv2.GaussianBlur(img, (3, 3), 0)
+    return np.clip(img, 0, 1)
+
+
 CRATE_PREFIX = "crate"
 CRATE_VARIANTS = 8  # adjacent crates must differ: one repeated texture lets
                     # SLAM alias by one crate spacing (~1.3m x-drift observed)
 FLOOR_FILE = "FLOOR_Albedo.png"
+STAIRS_FILE = "STAIRS_Albedo.png"
 
 
 def texture_files():
-    return [FLOOR_FILE] + [f"{CRATE_PREFIX}_{i}.png" for i in range(CRATE_VARIANTS)]
+    return [FLOOR_FILE, STAIRS_FILE] + [f"{CRATE_PREFIX}_{i}.png" for i in range(CRATE_VARIANTS)]
 
 
 def ensure_textures(force=False, seed=None):
@@ -87,7 +111,7 @@ def ensure_textures(force=False, seed=None):
         return
     seed = int(os.environ.get("TINYNAV_TEX_SEED", "42")) if seed is None else seed
     rng = np.random.default_rng(seed)
-    jobs = [(FLOOR_FILE, floor_texture)] + [
+    jobs = [(FLOOR_FILE, floor_texture), (STAIRS_FILE, stair_texture)] + [
         (f"{CRATE_PREFIX}_{i}.png", crate_texture) for i in range(CRATE_VARIANTS)
     ]
     for fname, gen in jobs:
