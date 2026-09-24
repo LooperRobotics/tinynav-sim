@@ -1,22 +1,22 @@
-# sim/ — gzsim 仿真层
+# gazebo/ — gzsim 仿真层
 
 从老 tinynav 仓库的 `tool/simulator/` 搬出，路径已适配本仓库布局。对应关系：
 
 | 老位置（tinynav 仓库）            | 新位置（tinynav-sim）      |
 | --------------------------------- | -------------------------- |
-| `tool/simulator/worlds/`          | `sim/worlds/`              |
-| `tool/simulator/robots/{go2,lekiwi}/` | `sim/robots/{go2,lekiwi}/` |
-| `tool/simulator/gazebo_scene/`    | `sim/scene/`               |
-| `tool/simulator/kill_sim.sh`      | `sim/kill_sim.sh`          |
-| `scripts/run_simulator.sh`        | `sim/run_simulator.sh`     |
+| `tool/simulator/worlds/`          | `gazebo/worlds/`              |
+| `tool/simulator/robots/{go2,lekiwi}/` | `gazebo/robots/{go2,lekiwi}/` |
+| `tool/simulator/gazebo_scene/`    | `gazebo/scene/`               |
+| `tool/simulator/kill_sim.sh`      | `gazebo/kill_sim.sh`          |
+| `scripts/run_simulator.sh`        | `gazebo/run_simulator.sh`     |
 | `tinynav/core/*.py`（uv run 跑）  | `reference/tinynav/core/*.py`（直接 `python3` 跑） |
 | `tinynav/platforms/{simulator_control,keyboard_teleop.py}` | `reference/tinynav/platforms/` |
 
 ## 两种启动方式（run_simulator.sh 与 sim.launch.py 的分工）
 
-- **`sim/run_simulator.sh`**（tmux 9 窗口）：单机开发全家桶——sim + 栈 +
+- **`gazebo/run_simulator.sh`**（tmux 9 窗口）：单机开发全家桶——sim + 栈 +
   rviz 一个命令起齐，每窗口可看实时输出、`tee logs/*.log`。调试日常用它。
-- **`sim/launch/sim.launch.py`**（ros2 launch）：sim 层独立产品面——只含
+- **`gazebo/launch/sim.launch.py`**（ros2 launch）：sim 层独立产品面——只含
   gz server/gui、spawn、gz bridge、camera_info、simulator_control（teleop
   可选），**不含任何导航栈**。分机部署（x86 跑 sim+perception，Orin 跑
   bridge+三件）用它与 `tinynav_cpp/launch/{perception,orin_stack}.launch.py`
@@ -37,7 +37,7 @@
   # 终端 1：sim 层（/clock 归它管）。remote_planning:=true 把跟随器重映射
   #        到 /sim/trajectory_path，接 Orin 桥过来的轨迹；gui/rviz 默认起。
   cd /workspace/dm/tinynav-sim && source /opt/ros/humble/setup.bash
-  ros2 launch sim/launch/sim.launch.py world:=sim/worlds/yard.sdf robot:=go2 \
+  ros2 launch gazebo/launch/sim.launch.py world:=gazebo/worlds/yard.sdf robot:=go2 \
       remote_planning:=true
 
   # 终端 2：perception（/slam/* 重映射进 camera-box 命名空间出站）
@@ -54,10 +54,10 @@
   /clock）。改过代码或 config 后先 `colcon build --packages-select
   tinynav_cpp`——launch 读的是 `install/` 下的拷贝，Orin 侧同理。想要
   per-node 日志就在两侧 export `TINYNAV_DB_PATH`（Orin 的 nav_env.sh 已带）。
-  收摊：x86 `bash sim/kill_sim.sh`（单独一条跑）；Orin
+  收摊：x86 `bash gazebo/kill_sim.sh`（单独一条跑）；Orin
   `pkill -f "[o]rin_stack"`（方括号防 pkill 匹配到自己的命令行）。
 
-  起来后确认：x86 `bash sim/dog_state.sh --slam`（gz 真值 + yaw + 是否在
+  起来后确认：x86 `bash gazebo/dog_state.sh --slam`（gz 真值 + yaw + 是否在
   建图轨迹包围盒内）；链路用数据面探针
   `python3 tools/probes/probe_first_msg.py /camera/camera/slam/odometry_visual
   Odometry`。Cyclone 模式下 ros2 CLI 正常可用（不再是 discovery-server
@@ -69,7 +69,7 @@
 ## 布局
 
 ```
-sim/
+gazebo/
 ├── run_simulator.sh   # 启动器：每组件一个 tmux 窗口（单机开发用）
 ├── launch/sim.launch.py  # sim 层独立 launch（分机部署；dds:=cyclone 默认，DDS 环境内置）
 ├── fastdds_udp.xml    # （备用）FastDDS 2.6 XML：UDPv4-only + 白名单
@@ -97,10 +97,10 @@ docker run --rm --gpus all --network host -it \
   uniflexai/tinynav:latest bash
 
 # 容器内：
-bash sim/run_simulator.sh                    # 默认 --stack full --robot go2 --world empty
-bash sim/run_simulator.sh --robot lekiwi --world yard
-bash sim/run_simulator.sh --auto l_corridor  # 剧本场景
-bash sim/run_simulator.sh --stack sensor     # 只起传感器面（pilot 拥有其余部分）
+bash gazebo/run_simulator.sh                    # 默认 --stack full --robot go2 --world empty
+bash gazebo/run_simulator.sh --robot lekiwi --world yard
+bash gazebo/run_simulator.sh --auto l_corridor  # 剧本场景
+bash gazebo/run_simulator.sh --stack sensor     # 只起传感器面（pilot 拥有其余部分）
 tmux attach -t tinynav_sim                   # 看各窗口
 ```
 
@@ -128,12 +128,12 @@ docker run --rm --gpus all --network host -v "$PWD":/ws -w /ws \
   uniflexai/tinynav:latest bash -c \
   'source /opt/ros/humble/setup.bash && colcon build --packages-select tinynav_cpp'
 
-bash sim/run_simulator.sh --stack cpp     # 或 TINYNAV_STACK=cpp
+bash gazebo/run_simulator.sh --stack cpp     # 或 TINYNAV_STACK=cpp
 ```
 
 cpp 栈直接拥有 `/slam/odometry_visual`：没有 raw 流 remap，因此没有
 sim_gt_reloc，`--map` / `--auto` 与 `--stack cpp` 互斥。发目标用
-`bash sim/scene/pub_target.sh`（直接发 `/control/target_pose`）。
+`bash gazebo/scene/pub_target.sh`（直接发 `/control/target_pose`）。
 
 ## 贴图路径（model://）
 
@@ -143,8 +143,8 @@ sim_gt_reloc，`--map` / `--auto` 与 `--stack cpp` 互斥。发目标用
 
 ## stairs 世界（楼梯，2026-09-24）
 
-`sim/worlds/stairs.sdf`：两段楼梯 + 中间转向平台（L 形折返）。几何由
-`sim/worlds/gen_stairs_sdf.py` 生成（改 RISE/TREAD/N 后重跑覆盖），当前为
+`gazebo/worlds/stairs.sdf`：两段楼梯 + 中间转向平台（L 形折返）。几何由
+`gazebo/worlds/gen_stairs_sdf.py` 生成（改 RISE/TREAD/N 后重跑覆盖），当前为
 **常用室内楼梯尺寸：踢面 0.15 m / 踏面 0.28 m / 宽 1.4 m，每段 8 级
 （第一段顶 1.2 m，第二段顶 2.4 m）**，实心到地台阶 + STAIRS 混凝土踏面贴图
 （gen_textures 生成，踢沿暗带+白线供 SLAM 特征）+ 低侧护栏 + 箱墙远场锚点。
@@ -161,7 +161,7 @@ treadmill trot（skating 步态，落足高度取体相对值、无地形感知�
 **路线 A 盲爬适配：已暂停、步态修改已回退（2026-09-24）**。首轮实现在平地
 回归中翻倒，根因已定位（反射被正常摆动滞后误触发 + joint_states 乱序 +
 限速单位错），详见 `docs/stairs-gait.md` 第 4 节；适配版代码存档在
-`sim/robots/go2/stair_adapt_wip/`。当前 `go2_controller.py` 为原版，平地
+`gazebo/robots/go2/stair_adapt_wip/`。当前 `go2_controller.py` 为原版，平地
 行为已验证正常。楼梯世界（15cm 标准踢面）保留可用，重启 sim 生效。
 
 ## 其他

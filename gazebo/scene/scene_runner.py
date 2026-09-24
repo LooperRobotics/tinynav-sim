@@ -5,13 +5,13 @@ Reference: star-core modules/simulation/scripts/auto/auto_sim_node.py, adapted
 for Ignition Fortress, which has no gz-transport Python bindings -- entity
 create/remove/set_pose go through the `ign service` CLI instead.
 
-Prereq: the sim stack is already up (bash sim/run_simulator.sh), with the
+Prereq: the sim stack is already up (bash gazebo/run_simulator.sh), with the
 gz server running a world that loads gz-sim-user-commands-system (every
-world under sim/worlds/ does).
+world under gazebo/worlds/ does).
 
 Usage:
-    python3 sim/scene/scene_runner.py l_corridor
-    python3 sim/scene/scene_runner.py config/scenes/l_corridor.json --spawn-only
+    python3 gazebo/scene/scene_runner.py l_corridor
+    python3 gazebo/scene/scene_runner.py config/scenes/l_corridor.json --spawn-only
 
 Scene JSON (see config/scenes/l_corridor.json):
     robot   : {name, pose[x,y,z,roll,pitch,yaw]} -- set_pose target at reset

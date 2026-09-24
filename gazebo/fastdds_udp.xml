@@ -4,7 +4,7 @@
      ROS_DISCOVERY_SERVER instead; this file adds what env vars cannot
      express: interface whitelist and socket buffer sizes).
 
-     Usage: FASTRTPS_DEFAULT_PROFILES_FILE=sim/fastdds_udp.xml, and export
+     Usage: FASTRTPS_DEFAULT_PROFILES_FILE=gazebo/fastdds_udp.xml, and export
      FASTRTPS_HOST_IP=<real NIC IP> for the $(...) substitution.
 
      Hard-won notes (2026-09-20):

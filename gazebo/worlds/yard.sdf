@@ -3,7 +3,7 @@
      crate walls, pillars and loose crates (l/u_corridor vocabulary, drive-test
      standoffs). Visual anchors for far-field stereo from a high camera (go2);
      the field inside the U stays ~6 m wide and open.
-     Robots spawn by type at run time (sim/robots/<type>/). -->
+     Robots spawn by type at run time (gazebo/robots/<type>/). -->
 <sdf version="1.9">
   <world name="yard">
     <physics name="1ms" type="ignored">

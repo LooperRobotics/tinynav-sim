@@ -1,6 +1,6 @@
 <?xml version="1.0" ?>
 <!-- Flat-ground scene (robot-free): infinite ground plane, no obstacles, no robot.
-     Robots spawn by type at run time (sim/robots/<type>/).
+     Robots spawn by type at run time (gazebo/robots/<type>/).
      The textured floor keeps stereo SLAM alive on an otherwise empty ground;
      this is the default world for every robot. -->
 <sdf version="1.9">

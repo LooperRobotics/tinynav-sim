@@ -2,8 +2,8 @@
 
 **[2026-09-24 状态：暂停，步态修改已回退]**。Phase 1 平地回归 B 组两次翻倒，
 根因已定位（见文末"暂停时的根因"），恢复前先按"修正方向"改反射判定。
-WIP 存档：`sim/robots/go2/stair_adapt_wip/`（含适配版 go2_controller.py、
-fk_check.py、routeA.patch）；恢复 = 把前两个文件拷回 `sim/robots/go2/`。
+WIP 存档：`gazebo/robots/go2/stair_adapt_wip/`（含适配版 go2_controller.py、
+fk_check.py、routeA.patch）；恢复 = 把前两个文件拷回 `gazebo/robots/go2/`。
 当前仓库里的 go2_controller.py 是 HEAD 原版（已验证平地行为正常）。
 
 2026-09-24 首轮实现，改动脉冲全部加性、可门控，平地回归是第一验收项。
@@ -39,22 +39,22 @@ robot_height`），控制器假设地面高度恒定。上台阶时前摆足撞�
 
 ## 2. 改动清单
 
-- `sim/robots/go2/go2_controller.py`：FK 方法、`SupportEstimator`、State 加
+- `gazebo/robots/go2/go2_controller.py`：FK 方法、`SupportEstimator`、State 加
   `swing_z_bias`/`pitch_cmd`、swing 目标加偏置项、step() 加俯仰旋转、节点加
   参数/joint_states 订阅/主循环接线、`STAIR_*` 常数表。
-- `sim/robots/go2/fk_check.py`：离线单元检查（stub ROS，容器直接跑，无需 sim）。
-- `sim/worlds/{stairs.sdf,gen_stairs_sdf.py}`：楼梯世界（踢面 0.15/踏面
+- `gazebo/robots/go2/fk_check.py`：离线单元检查（stub ROS，容器直接跑，无需 sim）。
+- `gazebo/worlds/{stairs.sdf,gen_stairs_sdf.py}`：楼梯世界（踢面 0.15/踏面
   0.28/每段 8 级，L 折返，转本生成器重出）。
 
 ## 3. 验证计划（未执行）
 
 ### Phase 0 — 离线单元（已完成 2026-09-24，全绿）
-`python3 sim/robots/go2/fk_check.py`：T1 FK 往返 1.4e-16；T2 俯仰差动方向；
+`python3 gazebo/robots/go2/fk_check.py`：T1 FK 往返 1.4e-16；T2 俯仰差动方向；
 T3 零偏置=legacy（1e-15）；T4 平地语义；T5 合成楼梯反射/俯仰/爬升标志；
 T6 衰减。
 
 ### Phase 1 — 平地回归（第一优先，空世界）
-- 启动：`bash sim/run_simulator.sh --world sim/worlds/empty.sdf`（cpp 栈或
+- 启动：`bash gazebo/run_simulator.sh --world gazebo/worlds/empty.sdf`（cpp 栈或
   sensor 栈），go2 出生原点。
 - 驱动脚本分五段：静止踏步 10s → 前进 0.04×20s → 停 5s → 前进+偏航
   (0.04, wz 0.3)×15s → 横移 0.01×10s；全程 10Hz 采 gz 真值 + gt_twist 落盘。

@@ -34,15 +34,15 @@ export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp CYCLONEDDS_URI=""
 
 ```bash
 # 带地图导航（C++ 栈，重定位在环）
-bash sim/run_simulator.sh --stack cpp --map --map-dir output/map_v2 \
-    --world sim/worlds/yard.sdf
+bash gazebo/run_simulator.sh --stack cpp --map --map-dir output/map_v2 \
+    --world gazebo/worlds/yard.sdf
 
 # 不带地图（纯感知+规划自由跑）
-bash sim/run_simulator.sh --stack full --robot go2
+bash gazebo/run_simulator.sh --stack full --robot go2
 
 # 看各窗口输出 / 收摊
 tmux attach -t tinynav_sim        # 窗口: gz gui robot bridge caminfo control teleop cpp rviz
-bash sim/kill_sim.sh              # 启动器每次自己也会先跑它
+bash gazebo/kill_sim.sh              # 启动器每次自己也会先跑它
 ```
 
 参数速查：
@@ -51,7 +51,7 @@ bash sim/kill_sim.sh              # 启动器每次自己也会先跑它
 |---|---|
 | `--stack full\|sensor\|cpp` | full=python 全栈；cpp=单进程 C++ 栈（tinynav.launch.py）；sensor=只传感器面 |
 | `--map` + `--map-dir <dir>` | 加载 map format v2 目录（`tools/export_map_v2.py` 产物），启用 C++ 重定位 |
-| `--world <sdf>` | 必须给 **SDF 路径**（如 `sim/worlds/yard.sdf`），不是名字；empty 无纹理，**reloc 验证用 yard** |
+| `--world <sdf>` | 必须给 **SDF 路径**（如 `gazebo/worlds/yard.sdf`），不是名字；empty 无纹理，**reloc 验证用 yard** |
 | `--auto <scene>` | 剧本场景（与 `--stack cpp` 互斥） |
 | `--db <path>` | 各窗口 TINYNAV_DB_PATH |
 
@@ -70,7 +70,7 @@ ros2 topic pub -w 1 -r 5 -t 8 /control/target_pose nav_msgs/msg/Odometry \
 ## 3. 开工前的状态确认（纪律）
 
 ```bash
-bash sim/dog_state.sh --slam --map-dir output/map_v2
+bash gazebo/dog_state.sh --slam --map-dir output/map_v2
 ```
 
 输出 gz 真值位姿+yaw、SLAM odom、与建图轨迹包围盒的 IN/OUT 判定。
@@ -91,7 +91,7 @@ C++ 栈只吃 map format v2；图的**生产**仍走 python 工具链，两步�
 
 ```bash
 # 终端 1：起活栈（无图模式即可建图）
-bash sim/run_simulator.sh --stack full
+bash gazebo/run_simulator.sh --stack full
 
 # 终端 2：python BuildMapNode 直接吃实时 /slam/keyframe_* 流（跳过录包）
 python3 tools/build_map_live.py --map_save_path output/map_build_test
@@ -169,4 +169,4 @@ ros2 service call /mapping/stop  std_srvs/srv/Trigger   # 停止并就地保存 
 
 x86 跑 sim+perception、Orin 跑 bridge+栈的拓扑（`sim.launch.py` +
 `perception.launch.py` / `orin_stack.launch.py`，CycloneDDS 钉 USB 网卡），
-操作步骤见 `sim/README.md`。日常单机开发用不到。
+操作步骤见 `gazebo/README.md`。日常单机开发用不到。

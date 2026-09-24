@@ -51,7 +51,7 @@ intra-process (zero-copy) communication.
 ## Rig container quick facts (instance `tinynav`, image tinynav-runtime:x86_64)
 
 The user's GPU rig (full go2 gait chain, ros_gz_sim, .plan engines) — where
-every sim/e2e verification runs. Container name is `tinynav`; the repo mounts
+every gazebo/e2e verification runs. Container name is `tinynav`; the repo mounts
 at `/workspace/dm/tinynav-sim` (NOT /ws). Gotchas:
 
 - colcon build must be re-run after switching containers (CMake cache has
@@ -70,7 +70,7 @@ at `/workspace/dm/tinynav-sim` (NOT /ws). Gotchas:
 
 ## Debug & ops toolbox (all verified 2026-09-19)
 
-- `sim/dog_state.sh [--slam] [--map-dir <v2 map dir>]` — one-shot robot state:
+- `gazebo/dog_state.sh [--slam] [--map-dir <v2 map dir>]` — one-shot robot state:
   gz ground truth + yaw in degrees, SLAM odom (odom frame is offset ~-90° from
   gz world; never compare the two yaws directly), and an IN/OUT verdict against
   the mapped-trajectory bounding box (margin 0.5 m). Run BEFORE every new sim
@@ -96,7 +96,7 @@ at `/workspace/dm/tinynav-sim` (NOT /ws). Gotchas:
 
 ## Split-site rehearsal facts (2026-09-20)
 
-- Layout: container A (tinynav) runs `sim/launch/sim.launch.py` (owns the
+- Layout: container A (tinynav) runs `gazebo/launch/sim.launch.py` (owns the
   FastDDS discovery server, port 11811) + `tinynav_cpp/launch/
   perception.launch.py` (perception component, /slam/* remapped to
   /camera/camera/slam/*); container B (tinynav-orin) runs `tinynav_cpp/

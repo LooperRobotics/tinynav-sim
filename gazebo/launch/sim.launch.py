@@ -1,10 +1,10 @@
 """Sim-only site launch: gz world + robot + gz bridge + camera info + control.
 
-The ros2-launch replacement of the sim half of sim/run_simulator.sh — one
+The ros2-launch replacement of the sim half of gazebo/run_simulator.sh — one
 lifecycle, launch-scoped env (no tmux bashrc reset traps), no navigation
 stack. The stack starts separately and stays independent:
 
-    ros2 launch sim/launch/sim.launch.py world:=sim/worlds/yard.sdf
+    ros2 launch gazebo/launch/sim.launch.py world:=gazebo/worlds/yard.sdf
     ros2 launch tinynav_cpp perception.launch.py        # this machine, if any
     # (a remote site would run orin_stack.launch.py behind the link)
 

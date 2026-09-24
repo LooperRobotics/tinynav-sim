@@ -7,7 +7,7 @@ components, intra-process zero-copy communication).
 ## Layout
 
 ```
-sim/                gzsim worlds / robots / scripted scenes + run_simulator.sh
+gazebo/                gzsim worlds / robots / scripted scenes + run_simulator.sh
                     (extracted from tinynav/tool/simulator; stack-agnostic)
 reference/tinynav/  Python reference snapshot (core/*.py + cpp/*.cpp) of branch
                     gzy/fix/gzsim — the spec the C++ port must match. Read-only.

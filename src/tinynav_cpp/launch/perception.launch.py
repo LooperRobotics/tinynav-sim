@@ -1,5 +1,5 @@
 """X86 site of the split deployment: the perception component alone, next to
-the sim (start sim/launch/sim.launch.py first, same machine).
+the sim (start gazebo/launch/sim.launch.py first, same machine).
 
 Perception's /slam/* products are remapped into the camera-box namespace so
 they cross the link exactly once and collide with nothing on the Orin site —

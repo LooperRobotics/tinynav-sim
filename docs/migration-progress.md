@@ -20,7 +20,7 @@
 |---|---|---|
 | 仓库骨架（README/AGENTS/.gitignore/包骨架/launch/config） | ✅ | — |
 | `reference/` Python 快照（core/*.py + cpp/*.cpp + platforms 两个文件） | ✅ | import 实测通过 |
-| `sim/` 仿真资产 + run_simulator.sh 路径适配 + `--stack cpp` 分支 | ✅ | 容器内 gz 冒烟通过（empty.sdf 加载、话题列表正常） |
+| `gazebo/` 仿真资产 + run_simulator.sh 路径适配 + `--stack cpp` 分支 | ✅ | 容器内 gz 冒烟通过（empty.sdf 加载、话题列表正常） |
 | core math 库（math/imu/robot_specs） | ✅ | gtest + Python 对拍 |
 | mapping 库（vlad/fusion_window/path_prior/astar/semantic_retrieval + pose_graph/BA kernels） | ✅ | gtest + pose_graph_solve 对拍（vs 镜像 pybind .so） |
 | trt 封装（TRTBase + 8 模型，懒加载降级） | ✅ | gtest，无 GPU 时优雅降级；gzsim 实景推理验证 |
@@ -109,7 +109,7 @@
    实验证实进程内通信按 topic+QoS 匹配、与节点名无关，改名后链路/CPU 无变化）。
 6. **分机部署演练收尾**：~~a. B 侧数据面验证~~ ✅、~~b. 跨机行驶验收~~ ✅、
    ~~c. run_simulator.sh 定位~~ ✅（保留为单机开发全家桶，sim.launch 是
-   分机/sim 独立面，见 sim/README）、~~e. 知识库回写~~ ✅（QA 6.9）。
+   分机/sim 独立面，见 gazebo/README）、~~e. 知识库回写~~ ✅（QA 6.9）。
    **d. 实机阶段**仍开放：USB NCM 直连（192.168.55.x）跑
    discovery_server:=对端IP，chrony 日志对时，链路带宽/丢包实测。
 
@@ -171,7 +171,7 @@ python 栈共树），全部语义以 `reference/tinynav/core/logsetup.py` 为 s
   匹配 ~126 对、PnP VIO → /slam/odometry_visual 4Hz、VIO failed=0）→ C++ planning
   （occupancy grid + ESDF → 目标 10m 时 sel vx=0.60 goal_err=0° front_clr=满、
   /planning/trajectory_path 4Hz）→ simulator_control（/cmd_vel 0.6 m/s）。
-- `sim/robots/go2/spawn.sh` 增加 ros_gz_sim 缺失时的离线 fallback
+- `gazebo/robots/go2/spawn.sh` 增加 ros_gz_sim 缺失时的离线 fallback
   （ign sdf -p 转 SDF + ign service create）。
 
 **镜像缺口（仅指 uniflexai/tinynav:latest；Python 栈同样受影响，非本仓库移植问题）：**
@@ -193,7 +193,7 @@ go2 步态链完整可走；仓库挂载在 `/workspace/dm/tinynav-sim`（非 /w
 
 reloc img_shape 排查会话的复盘产物——同类问题不再手搭脚手架：
 
-1. **`sim/dog_state.sh`**：开工前一键确认机器狗状态（全局 AGENTS.md 纪律的
+1. **`gazebo/dog_state.sh`**：开工前一键确认机器狗状态（全局 AGENTS.md 纪律的
    工具化）。输出 gz 真值 + 自动换算的 yaw（度）；`--slam` 附 SLAM odom
    （odom 系与 gz world 系差固定安装偏置，实测 yaw -90°，两侧不要互比）；
    `--map-dir <v2图目录>` 对照建图轨迹包围盒（`pose_matrices.npy` x/y 平移
@@ -203,7 +203,7 @@ reloc img_shape 排查会话的复盘产物——同类问题不再手搭脚手�
    栈，每个被拒的 reloc 候选（LG <50）自动把该对完整 LG 输入写
    `<dir>/<live_ts>_<cand_ts>/`（map/live 六个 f32：kpts [1,512,2]、
    descps [1,512,256]、mask [1,512,1]（u8 转落盘 f32，引擎输入等价）+
-   meta.json（匹配数/VLAD sim/img_shape/dtype）+ live.png；上限 50 对防
+   meta.json（匹配数/VLAD gazebo/img_shape/dtype）+ live.png；上限 50 对防
    失败风暴；env 不设零开销）。**回放**：`tools/probes/probe_lg <dump目录>`
    的 @848 计数应与 meta.json match_count 逐位相等（实测 36=36）。这是
    上节临时脚手架的常驻版。
@@ -387,7 +387,7 @@ live keyframe 图像并排存盘目检——图像明显同地不同视角 → �
 其与 img_shape=544 + 边缘对组合吻合。若日后再现：mapping 组件的
 `TINYNAV_RELOC_DUMP_DIR` dump 通道（见"rig 调试工具箱"）自动落盘失败现场，
 `tools/probes/` 里的 probe_lg / probe_lg_race / probe_sp_race 直接回放，
-另见 `sim/dog_state.sh` 先排除"狗不在建图轨迹上"的预期失败。
+另见 `gazebo/dog_state.sh` 先排除"狗不在建图轨迹上"的预期失败。
 
 ## perception v2：GTSAM 因子图对齐（已落地）
 
@@ -461,7 +461,7 @@ infra2 camera_info / /clock 三条小话题**不走桥**：单消费者、~60KB/
   depth reliable——planning 的 latest_depth_only 订阅是 RELIABLE，QoS 必须
   配平，实测 best_effort 会被 rmw 拒配对）。
 - 三个 launch：
-  - `sim/launch/sim.launch.py`：sim 层独立启动（gz server/gui、spawn、
+  - `gazebo/launch/sim.launch.py`：sim 层独立启动（gz server/gui、spawn、
     gz bridge、camera_info、simulator_control、teleop 可选），spawn 位姿表
     与 bridge 话题表从 run_simulator.sh 移植；**含 discovery server 进程**
     （`python3 /opt/ros/humble/tools/fastdds/fastdds.py discovery -i 0`，
@@ -551,8 +551,8 @@ docker run --rm --gpus all --network host -v "$PWD":/ws -w /ws \
 
 # 仿真（python 栈 / cpp 栈）
 docker run --rm --gpus all --network host -v "$PWD":/ws -w /ws \
-  uniflexai/tinynav:latest bash sim/run_simulator.sh --robot go2 --world factory
-docker run ... bash sim/run_simulator.sh --stack cpp --robot go2 --world empty
+  uniflexai/tinynav:latest bash gazebo/run_simulator.sh --robot go2 --world factory
+docker run ... bash gazebo/run_simulator.sh --stack cpp --robot go2 --world empty
 ```
 
 ## 2026-09-23 关键帧降密 + map_v2 lazy + LiveCapture 落盘 + 深度 Z16

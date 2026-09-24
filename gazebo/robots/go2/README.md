@@ -1,9 +1,9 @@
 # Go2 rig (quadruped)
 
 The Unitree Go2 walking rig for the tinynav gz-sim simulator
-(`sim/run_simulator.sh --robot go2`). Worlds are robot-free
-(sim/worlds/: empty.sdf / depot.sdf / factory.sdf); every robot
-spawns from sim/robots/<type>/ -- the launcher keeps the per-world
+(`gazebo/run_simulator.sh --robot go2`). Worlds are robot-free
+(gazebo/worlds/: empty.sdf / depot.sdf / factory.sdf); every robot
+spawns from gazebo/robots/<type>/ -- the launcher keeps the per-world
 spawn-pose table (a teleport after VIO init poisons the ISAM graph, so the
 pose must be right at create time). The lekiwi cylinder stays the
 `--robot lekiwi` default.
@@ -54,12 +54,12 @@ turn is normal.
 ## Run
 
 `run_simulator.sh --robot go2` brings the whole stack up (the launcher also
-runs sim/kill_sim.sh first, so a previous rig never leaks into
+runs gazebo/kill_sim.sh first, so a previous rig never leaks into
 the next one). Manual:
 
 ```bash
 source /opt/ros/humble/setup.bash
-TINYNAV_WORLD_NAME=empty bash sim/robots/go2/spawn.sh
+TINYNAV_WORLD_NAME=empty bash gazebo/robots/go2/spawn.sh
 ```
 
 Spawn height matters: a 0.8 m drop flips the robot (soft position servo +

@@ -12,8 +12,8 @@ numpy only, no cv2, so it runs on the bare ROS python:
 
     docker exec tinynav bash -c \
       'source /opt/ros/humble/setup.bash && \
-       python3 /workspace/dm/tinynav-sim/tools/grab_topic.py \
-       /slam/keyframe_image --count 1 --out /workspace/dm/tinynav-sim/fixtures/grab'
+       python3 /workspace/dm/tinynav-gazebo/tools/grab_topic.py \
+       /slam/keyframe_image --count 1 --out /workspace/dm/tinynav-gazebo/fixtures/grab'
 
 If fewer than --count messages arrive within --timeout, exits 1 and keeps
 whatever it got.

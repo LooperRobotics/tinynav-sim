@@ -1,7 +1,7 @@
 #!/bin/bash
 # TinyNav gz-sim launcher: one named tmux window per component.
 #
-# Usage:  bash sim/run_simulator.sh [--stack full|sensor|cpp] [--map] [--world <sdf>] [--auto <scene>] [--db <path>] [--robot lekiwi|go2]
+# Usage:  bash gazebo/run_simulator.sh [--stack full|sensor|cpp] [--map] [--world <sdf>] [--auto <scene>] [--db <path>] [--robot lekiwi|go2]
 #          --db: exported as TINYNAV_DB_PATH to every window, so nodes that log
 #          via tinynav.core.logsetup land in the same data root as pilot's.
 #          TINYNAV_STACK in the environment pre-seeds --stack.
@@ -9,19 +9,19 @@
 # Default (--stack full): sim (depot factory) + perception + planning + teleop;
 #          --map also starts map_node and the rviz goal relay (localization +
 #          arrow goals).
-#          --world: base world SDF (default sim/worlds/empty.sdf).
+#          --world: base world SDF (default gazebo/worlds/empty.sdf).
 #                   Worlds carry NO robot: empty.sdf / depot.sdf / factory.sdf /
 #                   yard.sdf are pure environments, the robot spawns by type at
 #                   run time. yard.sdf = empty base + static textured anchor
 #                   walls: the go2's high camera needs far-field anchors or the
 #                   VIO sinks while driving on empty's repetitive floor -- pick
 #                   it for free driving; scripted scenes bring their own walls.
-#          --auto:  scripted scene (sim/scene, e.g. l_corridor):
+#          --auto:  scripted scene (gazebo/scene, e.g. l_corridor):
 #                   spawns obstacles, resets robot to origin, publishes targets.
 #
 # --robot go2: quadruped rig instead of the lekiwi cylinder. The Go2 carries
 #          the same D435i sensor head (identical topics/rates/baseline) but is
-#          a walking robot: it spawns from URDF (sim/robots/go2/,
+#          a walking robot: it spawns from URDF (gazebo/robots/go2/,
 #          see that directory's README) and desired velocity goes to
 #          /cmd_vel through the PI velocity servo (plant input: /robot1/cmd_vel).
 #          Spawn poses live in the per-world table below (go2 spawns crouched
@@ -37,10 +37,10 @@
 # --stack cpp: same sim face, but the perception/planning/map python windows
 #          are replaced by ONE window running the single-process C++ stack
 #          (ros2 launch tinynav_cpp tinynav.launch.py, needs a colcon build in
-#          $WS_ROOT/install -- see sim/README.md). The C++ node owns
+#          $WS_ROOT/install -- see gazebo/README.md). The C++ node owns
 #          /slam/odometry_visual directly: no raw-stream remap, so no
 #          sim_gt_reloc; conflicts with --auto. Goals go straight to
-#          /control/target_pose (sim/scene/pub_target.sh). --map loads a map
+#          /control/target_pose (gazebo/scene/pub_target.sh). --map loads a map
 #          format v2 directory (tools/export_map_v2.py output) and enables
 #          keyframe relocalization + global planning on the C++ side.
 #
@@ -58,7 +58,7 @@
 # Attach:  tmux attach -t tinynav_sim
 
 SESSION=tinynav_sim
-# Layout anchors: sim/ holds this script; the repo root holds reference/,
+# Layout anchors: gazebo/ holds this script; the repo root holds reference/,
 # output/, logs/. All old /tinynav + tool/simulator paths derive from these.
 SIM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WS_ROOT="$(dirname "$SIM_ROOT")"
@@ -119,7 +119,7 @@ if [[ $STACK == cpp ]] && [[ -n $AUTO_SCENE ]]; then
 fi
 # cpp + --map is allowed: the map v2 dir goes to the launch as map_path.
 if [[ $STACK == cpp && ! -f $WS_ROOT/install/setup.bash ]]; then
-  echo "--stack cpp needs $WS_ROOT/install/setup.bash -- colcon build first (see sim/README.md)"; exit 1
+  echo "--stack cpp needs $WS_ROOT/install/setup.bash -- colcon build first (see gazebo/README.md)"; exit 1
 fi
 # keyboard_teleop needs pynput, which the image does not ship (the old uv-run
 # flow synced it from uv.lock). Warn once here instead of a dead tmux pane.

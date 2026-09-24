@@ -4,7 +4,7 @@
 No ROS and no sim: rclpy/geometry_msgs/std_msgs are stubbed so the module
 imports cleanly. Run inside the tinynav container:
 
-    python3 sim/robots/go2/fk_check.py
+    python3 gazebo/robots/go2/fk_check.py
 
 Checks:
   T1  FK o IK round trip on a reachable grid, all four legs (< 1e-6 m)

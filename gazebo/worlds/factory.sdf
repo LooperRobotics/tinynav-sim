@@ -109,6 +109,6 @@
         </include>
 
         <!-- No robot here: robots spawn by type at run time
-         (sim/robots/<type>/), see sim/run_simulator.sh. -->
+         (gazebo/robots/<type>/), see gazebo/run_simulator.sh. -->
 </world>
 </sdf>

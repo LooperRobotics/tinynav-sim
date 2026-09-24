@@ -27,7 +27,7 @@ while node.get_clock().now().nanoseconds < end and (len(got["kf"]) < 2 or len(go
     rclpy.spin_once(node, timeout_sec=1)
 for key in got:
     for i, (t, enc, h, w, img) in enumerate(got[key]):
-        fn = f"/workspace/dm/tinynav-sim/fixtures/probe/{key}_{i}.png"
+        fn = f"/workspace/dm/tinynav-gazebo/fixtures/probe/{key}_{i}.png"
         cv2.imwrite(fn, img)
         print(key, i, f"t={t:.2f} enc={enc} {w}x{h} dtype={img.dtype} "
                       f"min={img.min()} max={img.max()} mean={img.mean():.1f} std={img.std():.1f}")

@@ -9,10 +9,10 @@
 # --slam). With no sim running the ign call times out and exits 1.
 #
 # Usage:
-#   sim/dog_state.sh                            # gz ground truth only
-#   sim/dog_state.sh --world yard               # skip world auto-detect
-#   sim/dog_state.sh --slam                     # + /slam/odometry_visual
-#   sim/dog_state.sh --map-dir output/map_v2    # + IN/OUT trajectory verdict
+#   gazebo/dog_state.sh                            # gz ground truth only
+#   gazebo/dog_state.sh --world yard               # skip world auto-detect
+#   gazebo/dog_state.sh --slam                     # + /slam/odometry_visual
+#   gazebo/dog_state.sh --map-dir output/map_v2    # + IN/OUT trajectory verdict
 #
 # The verdict is informational (exit status only reports sim reachability):
 # IN means inside the mapped bounding box + margin. OUT means reloc failures
@@ -40,7 +40,7 @@ if [[ -z "$WORLD" ]]; then
     | grep -oP '^/world/\K[a-zA-Z_0-9]+(?=/dynamic_pose/info)' | head -1)
   if [[ -z "$WORLD" ]]; then
     echo "ERROR: no /world/*/dynamic_pose/info topic — sim not running?" >&2
-    echo "start it: bash sim/run_simulator.sh ... (inside the rig container)" >&2
+    echo "start it: bash gazebo/run_simulator.sh ... (inside the rig container)" >&2
     exit 1
   fi
 fi
