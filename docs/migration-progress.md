@@ -2,8 +2,9 @@
 
 # 迁移进度与待办计划
 
-> 本文档随迁移滚动更新。最近更新：2026-09-20（分机部署架构落地：组件子集 +
-> looper_bridge 中继 + 三 launch；两容器演练 A 侧数据面已验证，B 侧待验）
+> 本文档随迁移滚动更新（时间线见 git 历史，本文只记事实与结论）。最近更新
+> 主题：分机部署架构落地（组件子集 + looper_bridge 中继 + 三 launch；两容器
+> 演练 A 侧数据面已验证，B 侧待验）
 
 ## 范围与决策（已与负责人确认）
 
@@ -105,7 +106,7 @@
    （/mapping/cmd_pois → global_plan → carrot 重投影 → 到达）。
 5. 小项：`--stack cpp` 时 `pub_target.sh` 的 `-w 1` 匹配慢（手动发目标建议
    `-r 2 -t 4`）。~~5 个同名 /tinynav 节点让 `ros2 param` CLI 无法定位规划
-   参数~~ ✅（2026-09-19 launch 去掉 `name='tinynav'` 覆盖，组件恢复真名；
+   参数~~ ✅（launch 去掉 `name='tinynav'` 覆盖，组件恢复真名；
    实验证实进程内通信按 topic+QoS 匹配、与节点名无关，改名后链路/CPU 无变化）。
 6. **分机部署演练收尾**：~~a. B 侧数据面验证~~ ✅、~~b. 跨机行驶验收~~ ✅、
    ~~c. run_simulator.sh 定位~~ ✅（保留为单机开发全家桶，sim.launch 是
@@ -113,7 +114,7 @@
    **d. 实机阶段**仍开放：USB NCM 直连（192.168.55.x）跑
    discovery_server:=对端IP，chrony 日志对时，链路带宽/丢包实测。
 
-## 分节点日志（logsetup.py 的 C++ 移植，2026-09-19 落地）
+## 分节点日志（logsetup.py 的 C++ 移植）
 
 对齐 python 侧 `<TINYNAV_DB_PATH>/logs/<YYYY-MM-DD>/<tag>.log` 布局（与
 python 栈共树），全部语义以 `reference/tinynav/core/logsetup.py` 为 spec：
@@ -189,7 +190,7 @@ go2 步态链完整可走；仓库挂载在 `/workspace/dm/tinynav-sim`（非 /w
 切换容器需重跑 colcon build（CMake cache 绝对路径失效）。环境坑与调试工具
 见下一节"rig 调试工具箱"，速查也写入仓库 AGENTS.md。
 
-## rig 调试工具箱（2026-09-19 落地，全部实测）
+## rig 调试工具箱（已落地，全部实测）
 
 reloc img_shape 排查会话的复盘产物——同类问题不再手搭脚手架：
 
@@ -271,7 +272,7 @@ reloc img_shape 排查会话的复盘产物——同类问题不再手搭脚手�
 - e2e 链路：build_map_live 采集（92 kf，x 0→6m）→ 导出 → `map v2 loaded`
   → 目标接受、自主行驶正常。
 
-**[已解决，2026-09-19，见"reloc 匹配数问题：已解决"节] 当时的现象：reloc 候选的 LightGlue 匹配只有 1~25 对（门槛 50），从未成功**：
+**[已解决，见"reloc 匹配数问题：已解决"节] 当时的现象：reloc 候选的 LightGlue 匹配只有 1~25 对（门槛 50），从未成功**：
 
 - 现象：每关键帧 3 个 VLAD 候选全部 "not enough matched features"；探针里
   map-vs-map（同图两帧）能到 208 对，map-vs-live 只有个位数到二十几。
@@ -301,7 +302,7 @@ reloc img_shape 排查会话的复盘产物——同类问题不再手搭脚手�
 - TRT 引擎级对拍（SuperPoint/LightGlue 输出逐值 vs Python wrapper）；
 - 场景套件 nightly（l/u/z_corridor、factory_01）。
 
-## reloc 根因探针记录（2026-09-19，rig 容器实测）
+## reloc 根因探针记录（rig 容器实测）
 
 目的：判定 map-vs-live LightGlue 匹配仅 1~25 对（map-vs-map 208 对）是
 C++ wrapper 问题还是数据/环境问题。探针源码现已迁至 `tools/probes/`
@@ -337,7 +338,7 @@ live keyframe 图像并排存盘目检——图像明显同地不同视角 → �
 （对策：建图覆盖视角 / 放宽 50 对门槛 / 建图也用 C++ wrapper 消除跨库
 配对）；图像几乎相同仍 1 对 → 组件填充路径 bug，转引擎级对拍。
 
-## reloc 匹配数问题：已解决（2026-09-19）
+## reloc 匹配数问题：已解决
 
 **根因：`match_keypoints` 的 `img_shape` 偏离了 python 语义。** python
 （`map_node.py::match_keypoints`）在两个调用点都用写死的
@@ -429,7 +430,7 @@ libgtsam_unstable + python 绑定），无需额外 docker 层。
 到的那条样本重复积分（每帧约一个样本区间 <10ms 的双重计入），批量方案每条
 样本恰好积分一次；两侧 batch 约定一致，对拍不受影响。
 
-## 分机部署（x86 = sim+perception ↔ Orin = bridge+三件，2026-09-20 实施中）
+## 分机部署（x86 = sim+perception ↔ Orin = bridge+三件）
 
 背景与拍板：perception 将跑在相机（实机 = Looper Insightfull 盒子，仿真 =
 x86 上的 gzsim）内部，Orin 只留 imu/mapping/planning 三件。跨机链路复用
@@ -483,7 +484,7 @@ fflap；实机跨主机本无 SHM，UDP-only 让演练=部署）+ `ROS_DISCOVERY
 =<sim站点IP>:11811`（单播发现——点对点链路/wifi 组播不可靠）。演练实测
 demo talker/listener 跨容器互通。
 
-**两容器演练结果（2026-09-20，全链通过）：**
+**两容器演练结果（全链通过）：**
 
 - ✅ A 侧：sim（yard+go2）、perception 重映射产物 /camera/camera/slam/*
   数据面探针实测到达（VIO ISAM 正常求解）。
@@ -555,7 +556,7 @@ docker run --rm --gpus all --network host -v "$PWD":/ws -w /ws \
 docker run ... bash gazebo/run_simulator.sh --stack cpp --robot go2 --world empty
 ```
 
-## 2026-09-23 关键帧降密 + map_v2 lazy + LiveCapture 落盘 + 深度 Z16
+## 关键帧降密 + map_v2 lazy + LiveCapture 落盘 + 深度 Z16
 
 背景：艺尚狗实测 8 图 110G（单图 22G = 9587 帧 × f32 深度 13G + SP 特征 4.9G），
 关键帧阈值 0.03m≈逐帧存；map_v2 eager 物化在艺尚级真图上 ~18G RSS 必 OOM；
@@ -588,7 +589,7 @@ docker run ... bash gazebo/run_simulator.sh --stack cpp --robot go2 --world empt
   localhost.xml` 在 rig 容器不存在 → 所有 Cyclone 节点建域即死；run_simulator.sh
   已统一覆盖为空（分机 launch 自带 URI 不受影响）。
 
-### 2026-09-23 补：VLAD 检索索引 f64→f32（8G Orin Nano 预算）
+### 补：VLAD 检索索引 f64→f32（8G Orin Nano 预算）
 
 狗实为 Orin Nano 8G，f64 索引同密度 1.9G 不可接受。`MapV2::vlad_descriptors`
 改 **f32 行主序**（`VladIndex`，npy f32 直接 memcpy；f8 输入降精度兼容），

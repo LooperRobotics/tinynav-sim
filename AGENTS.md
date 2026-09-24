@@ -68,7 +68,7 @@ at `/workspace/dm/tinynav-sim` (NOT /ws). Gotchas:
 - Long C++ snippets: write on the host and `docker cp`; heredocs inside a
   double-quoted docker exec string eat the `$`s.
 
-## Debug & ops toolbox (all verified 2026-09-19)
+## Debug & ops toolbox (all field-verified)
 
 - `gazebo/dog_state.sh [--slam] [--map-dir <v2 map dir>]` — one-shot robot state:
   gz ground truth + yaw in degrees, SLAM odom (odom frame is offset ~-90° from
@@ -94,7 +94,7 @@ at `/workspace/dm/tinynav-sim` (NOT /ws). Gotchas:
   (`TINYNAV_LOG_MAX_MB`, 0=off); 14-day retention. Node names are the ported
   ones (no launch name override) — `ros2 param get /planning_node ...` works.
 
-## Split-site rehearsal facts (2026-09-20)
+## Split-site rehearsal facts
 
 - Layout: container A (tinynav) runs `gazebo/launch/sim.launch.py` (owns the
   FastDDS discovery server, port 11811) + `tinynav_cpp/launch/

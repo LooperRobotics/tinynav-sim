@@ -129,7 +129,7 @@ colcon build ... && ./build/tinynav_cpp/tinynav_core_test   # 72 用例应全绿
 `/bag/stop` → `/map/build`（bag 回放建图）→ 建完目录在 `tinynav_db/maps/`。
 给 C++ 栈用前同样要 `export_map_v2.py` 导出（sim 里已有替代，见 4.4）。
 
-### 4.4 C++ 在线建图（2026-09-24 落地）
+### 4.4 C++ 在线建图
 
 单进程 C++ 栈自己出图，不再需要 python 工具链。建图模式（`map_path` 为空）
 下用两个 service 控制会话：

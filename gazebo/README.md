@@ -63,8 +63,9 @@
   Odometry`。Cyclone 模式下 ros2 CLI 正常可用（不再是 discovery-server
   全盲状态）；但容器里手动跑 CLI/探针要先手动 export 与 launch 相同的两个
   DDS 变量——镜像 ENV 烤进去的 CYCLONEDDS_URI 指向不存在的文件，必须覆盖。
-  2026-09-20 两容器演练全链已通：四话题跨机 + 行驶验收 + reloc 位姿 3cm；
-  2026-09-21 真机 Orin（裸机 Jazzy）同链路 C3 行驶验收通过。
+  两容器演练全链已通：四话题跨机 + 行驶验收 + reloc 位姿 3cm；
+  真机 Orin 同链路 C3 行驶验收通过（当时裸机 Jazzy；Orin 已重刷
+  Ubuntu 22.04 + Humble，两侧同发行版，CycloneDDS 仍是指定配置）。
 
 ## 布局
 
@@ -141,7 +142,7 @@ sim_gt_reloc，`--map` / `--auto` 与 `--stack cpp` 互斥。发目标用
 `IGN_GAZEBO_RESOURCE_PATH=$SIM_ROOT/scene/models` 解析（空 URI 解析失败时 ign 会打
 `Unable to find file with URI`，脚本路径内已验证）。不依赖镜像里 `/tinynav` 的任何文件。
 
-## stairs 世界（楼梯，2026-09-24）
+## stairs 世界（楼梯）
 
 `gazebo/worlds/stairs.sdf`：两段楼梯 + 中间转向平台（L 形折返）。几何由
 `gazebo/worlds/gen_stairs_sdf.py` 生成（改 RISE/TREAD/N 后重跑覆盖），当前为
@@ -150,7 +151,7 @@ sim_gt_reloc，`--map` / `--auto` 与 `--stack cpp` 互斥。发目标用
 （gen_textures 生成，踢沿暗带+白线供 SLAM 特征）+ 低侧护栏 + 箱墙远场锚点。
 go2 出生点用全局默认 (0,0,0) 朝 +x，第一段楼梯起点 x=2.0。
 
-**步态现状（2026-09-24 实测，非结论性的运控验收）**：sim 的 go2 是 IK
+**步态现状（实测，非结论性的运控验收）**：sim 的 go2 是 IK
 treadmill trot（skating 步态，落足高度取体相对值、无地形感知）——8 cm 踢面
 单体能上（z_leg_lift 0.17 + 体高 0.28 时）但第二级起连续上不去；4 cm 踢面
 驱动能穿过梯段但躯体高度不升。**要爬标准 15 cm 踢面需要真改步态**（落足点
@@ -158,7 +159,7 @@ treadmill trot（skating 步态，落足高度取体相对值、无地形感知�
 自带栈，不受此影响。楼梯世界的当前价值 = 建图/climb 标签/导航链路验证
 （path_climb 的 MIN_RISE=0.12 阈值对 0.15 m 踢面正常打标）。
 
-**路线 A 盲爬适配：已暂停、步态修改已回退（2026-09-24）**。首轮实现在平地
+**路线 A 盲爬适配：已暂停、步态修改已回退**。首轮实现在平地
 回归中翻倒，根因已定位（反射被正常摆动滞后误触发 + joint_states 乱序 +
 限速单位错），详见 `docs/stairs-gait.md` 第 4 节；适配版代码存档在
 `gazebo/robots/go2/stair_adapt_wip/`。当前 `go2_controller.py` 为原版，平地

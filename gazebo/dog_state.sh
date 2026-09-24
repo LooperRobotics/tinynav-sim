@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-shot robot state check — makes the "confirm position & heading before
 # every new operation" discipline a single command instead of hand-run ign
-# commands and mental yaw math. Born from the 2026-09-19 reloc session: the
+# commands and mental yaw math. Born from the reloc session: the
 # dog sat at y=1.95, yaw 104° (off the mapped line), reloc failures were
 # CORRECT behavior, and a round of debugging was burned before anyone looked.
 #
