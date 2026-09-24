@@ -1,0 +1,12 @@
+{
+  "robot": "go2",
+  "scene": "nav_scene_1/mjcf/scene.xml",
+  "scene_gaussians": {
+    "scene": "nav_scene_1/3dgs/point_cloud.ply"
+  },
+  "assets_dir": "assets",
+  "robot_gs_dir": "assets/go2",
+  "save_dir": "data/navigation_go2",
+  "prompt": "Navigate in the scene",
+  "auto_reset": true
+}

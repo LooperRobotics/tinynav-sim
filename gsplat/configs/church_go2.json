@@ -1,0 +1,18 @@
+{
+  "robot": "go2",
+  "scene": "church_scene/mjcf/scene.xml",
+  "scene_gaussians": {
+    "scene": "church_scene/3dgs/church.ply"
+  },
+  "assets_dir": "assets",
+  "robot_gs_dir": "assets/go2",
+  "save_dir": "data/navigation_church",
+  "prompt": "Navigate inside the church",
+  "auto_reset": true,
+  "initial_qpos": [
+    0, 0, 0.445,
+    0, 0, 0.70710678, 0.70710678,
+    0.1, 0.9, -1.8, -0.1, 0.9, -1.8,
+    0.1, 0.9, -1.8, -0.1, 0.9, -1.8
+  ]
+}
