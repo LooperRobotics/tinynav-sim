@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <Eigen/Dense>
 #include <opencv2/core.hpp>
 
 #include "tinynav_cpp/mapping/map_v2.hpp"
@@ -98,6 +99,35 @@ public:
 
   bool has(int64_t ts) const { return row_of_.count(ts) != 0; }
   size_t size() const { return timestamps_.size(); }
+
+  // DINOv2 patch tokens for the VLAD index (build_map_node.py keeps them
+  // write-through in db.patch_tokens). Call right after the matching append()
+  // succeeded — row alignment against the captured frame is enforced. tokens:
+  // non-empty CV_32F (rows, cols), continuous or cloneable. Idempotent per ts.
+  bool append_tokens(int64_t ts, const cv::Mat & tokens);
+
+  // Double copy of the stored token row for VLAD training / descriptors
+  // (build_map_node streams these through train_vocabulary_streaming).
+  // Returns false (out untouched) when the frame has no tokens.
+  bool get_tokens(int64_t ts, Eigen::MatrixXd & out) const;
+
+  bool has_tokens() const { return tok_rows_ > 0 && tok_cols_ > 0; }
+  int64_t token_rows() const { return tok_rows_; }
+  int64_t token_cols() const { return tok_cols_; }
+  size_t token_frames() const { return tok_row_of_.size(); }
+
+  // Session dims for meta.json (informational; zero before the first append).
+  int depth_height() const { return depth_h_; }
+  int depth_width() const { return depth_w_; }
+  int64_t desc_dim() const { return desc_dim_; }
+  int64_t feature_rows() const {
+    return feature_offsets_.empty() ? 0 : feature_offsets_.back();
+  }
+
+  // End the session and allow a fresh one: close() plus a full state wipe.
+  // The next append wipes the directory again (scratch contract). This is the
+  // /mapping/start restart path.
+  void reset();
 
   // Owning CV_32F HxW meters (converted from the u16 mm row); empty when the
   // frame is unknown or nothing was appended yet.
@@ -245,13 +275,17 @@ private:
   std::unique_ptr<GrowFile> kpts_file_;    // feature_kpts <f4 [M,2]
   std::unique_ptr<GrowFile> descps_file_;  // feature_descps <f4 [M,D]
   std::unique_ptr<GrowFile> mask_file_;    // feature_mask u1 [M]
+  std::unique_ptr<GrowFile> tokens_file_;  // patch_tokens <f4 [T,R,C]
 
   std::vector<int64_t> timestamps_;
   std::vector<int64_t> feature_offsets_;  // cumulative kpt rows, leading 0
   std::unordered_map<int64_t, uint32_t> row_of_;
+  std::unordered_map<int64_t, uint32_t> tok_row_of_;  // ts -> token row
+  size_t tok_count_ = 0;
 
   int depth_h_ = 0, depth_w_ = 0;
   int64_t desc_dim_ = 0;
+  int64_t tok_rows_ = 0, tok_cols_ = 0;
   std::vector<uint16_t> depth_scratch_;   // reusable f32m -> u16mm buffer
   std::vector<uint8_t> mask_scratch_;
 };

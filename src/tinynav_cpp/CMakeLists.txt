@@ -15,6 +15,7 @@ find_package(sensor_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
@@ -86,7 +87,7 @@ foreach(comp planning mapping perception imu_propagator)
       "${TINYNAV_GTSAM_ROOT}/build/gtsam;${TINYNAV_GTSAM_ROOT}/build/gtsam_unstable")
   endif()
   ament_target_dependencies(${comp}_component
-    rclcpp rclcpp_components sensor_msgs nav_msgs geometry_msgs std_msgs
+    rclcpp rclcpp_components sensor_msgs nav_msgs geometry_msgs std_msgs std_srvs
     tf2 tf2_ros tf2_geometry_msgs cv_bridge message_filters)
   list(APPEND COMPONENT_TARGETS ${comp}_component)
 endforeach()

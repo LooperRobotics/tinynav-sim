@@ -51,7 +51,8 @@ bool LiveCapture::ensure_open(std::string & error)
   if (!make(depth_file_, "depth_images.npy", "<u2", 3) ||
     !make(kpts_file_, "feature_kpts.npy", "<f4", 2) ||
     !make(descps_file_, "feature_descps.npy", "<f4", 2) ||
-    !make(mask_file_, "feature_mask.npy", "|u1", 1))
+    !make(mask_file_, "feature_mask.npy", "|u1", 1) ||
+    !make(tokens_file_, "patch_tokens.npy", "<f4", 3))
   {
     return false;
   }
@@ -180,6 +181,70 @@ cv::Mat LiveCapture::get_depth(int64_t ts) const
   return out;
 }
 
+bool LiveCapture::append_tokens(int64_t ts, const cv::Mat & tokens)
+{
+  std::string error;
+  if (!open_ || closed_) {
+    return false;
+  }
+  // The token row hangs off an already-captured frame, once.
+  if (row_of_.count(ts) == 0) {
+    return false;
+  }
+  if (tok_row_of_.count(ts) != 0) {
+    return true;
+  }
+  if (tokens.empty() || tokens.type() != CV_32F) {
+    return false;
+  }
+  if (tok_rows_ == 0) {
+    tok_rows_ = tokens.rows;
+    tok_cols_ = tokens.cols;
+  } else if (tokens.rows != tok_rows_ || tokens.cols != tok_cols_) {
+    return false;
+  }
+  const cv::Mat c = tokens.isContinuous() ? tokens : tokens.clone();
+  if (!tokens_file_->append(
+      c.data, static_cast<size_t>(tok_rows_) * tok_cols_ * sizeof(float), error))
+  {
+    return false;
+  }
+  tok_row_of_[ts] = static_cast<uint32_t>(tok_count_++);
+  return true;
+}
+
+bool LiveCapture::get_tokens(int64_t ts, Eigen::MatrixXd & out) const
+{
+  const auto it = tok_row_of_.find(ts);
+  if (it == tok_row_of_.end() || !open_ || tok_rows_ == 0 || tok_cols_ == 0) {
+    return false;
+  }
+  const size_t n = static_cast<size_t>(tok_rows_) * tok_cols_;
+  const auto * src = static_cast<const float *>(
+    tokens_file_->view(it->second * n * sizeof(float)));
+  out = Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic,
+    Eigen::RowMajor>>(src, static_cast<Eigen::Index>(tok_rows_),
+                      static_cast<Eigen::Index>(tok_cols_)).cast<double>();
+  return true;
+}
+
+void LiveCapture::reset()
+{
+  close();
+  closed_ = false;
+  open_ = false;
+  timestamps_.clear();
+  feature_offsets_.clear();
+  row_of_.clear();
+  tok_row_of_.clear();
+  tok_count_ = 0;
+  depth_h_ = depth_w_ = 0;
+  desc_dim_ = 0;
+  tok_rows_ = tok_cols_ = 0;
+  depth_scratch_.clear();
+  mask_scratch_.clear();
+}
+
 void LiveCapture::close()
 {
   if (!open_ || closed_) {
@@ -196,6 +261,8 @@ void LiveCapture::close()
   kpts_file_->finalize({total_rows, 2}, error);
   descps_file_->finalize({total_rows, desc_dim_}, error);
   mask_file_->finalize({total_rows}, error);
+  tokens_file_->finalize({static_cast<int64_t>(tok_count_), tok_rows_, tok_cols_},
+    error);
 
   // feature_offsets_ already carries the v2 leading zero
   write_small_npy(dir_ + "/feature_offsets.npy", "<i8",
@@ -207,7 +274,10 @@ void LiveCapture::close()
   std::ofstream meta(dir_ + "/meta.json");
   meta << "{\"format\": \"tinynav_live_v1\", \"depth\": \"u16_mm\", "
        << "\"keyframes\": " << timestamps_.size() << ", \"h\": " << depth_h_
-       << ", \"w\": " << depth_w_ << ", \"desc_dim\": " << desc_dim_ << "}";
+       << ", \"w\": " << depth_w_ << ", \"desc_dim\": " << desc_dim_
+       << ", \"patch_frames\": " << tok_count_
+       << ", \"patch_rows\": " << tok_rows_
+       << ", \"patch_cols\": " << tok_cols_ << "}";
 }
 
 }  // namespace tinynav::mapping

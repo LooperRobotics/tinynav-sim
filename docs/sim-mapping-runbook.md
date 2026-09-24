@@ -127,8 +127,33 @@ colcon build ... && ./build/tinynav_cpp/tinynav_core_test   # 72 用例应全绿
 
 狗上仍是 python 栈的 web 流程：`/bag/start` → 途中 `/bag/poi-marks` 打点 →
 `/bag/stop` → `/map/build`（bag 回放建图）→ 建完目录在 `tinynav_db/maps/`。
-给 C++ 栈用前同样要 `export_map_v2.py` 导出。C++ 在线建图尚未落地，
-落地后此节将被"统一会话采集 + 一次 finalize"取代。
+给 C++ 栈用前同样要 `export_map_v2.py` 导出（sim 里已有替代，见 4.4）。
+
+### 4.4 C++ 在线建图（2026-09-24 落地）
+
+单进程 C++ 栈自己出图，不再需要 python 工具链。建图模式（`map_path` 为空）
+下用两个 service 控制会话：
+
+```bash
+ros2 service call /mapping/start std_srvs/srv/Trigger   # 开始采集（清空输出目录）
+ros2 service call /mapping/stop  std_srvs/srv/Trigger   # 停止并就地保存 map v2
+```
+
+- 输出目录 = `map_save_path` 参数（默认 `output/map_cpp_v2`）；start 会把
+  live capture 指过去并清空，stop 直接在**同一目录**补齐 poses / VLAD /
+  intrinsics / path_speed / path_climb / occupancy / sdf / meta——采集 npy
+  本来就是图文件，零拷贝零转换。
+- **门控语义**：未 start / 已 stop 时（仅建图模式），关键帧三元组直接丢弃——
+  无 cv_bridge 拷贝、无 SP/DINOv2 推理、无落盘，资源留给 stop 时的收尾全局
+  优化（位姿图 max_iter=1024 + VLAD 5 epochs + occupancy 烘焙，秒级，在
+  stop 的 service 回调里同步完成，response 即结果）。导航模式（已加载图）
+  不受门控影响，reloc 照常工作。
+- SIGINT 时若仍在录制，析构会自动保存（等价 build_map_live 的 Ctrl+C）。
+- 已载入地图的栈调 /mapping/start 会被拒绝（nav 模式不提供录制）。
+
+验收锚点（教堂 bag church_corridor_04，28 keyframes）：出图 8.10 m 路径
+（VIO 参照 8.3 m）、VLAD 28×24576 无重复行、path_speed 中位数 0.449 m/s；
+图回灌 `--map --map-dir` 后 reloc hit inlier 0.99–1.00。
 
 ## 5. 重定位排查工具
 

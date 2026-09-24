@@ -55,6 +55,9 @@
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/float32.hpp>
 #include <std_msgs/msg/string.hpp>
+#include <std_srvs/srv/trigger.hpp>
+
+#include <random>
 
 #include "tinynav_cpp/core/math.hpp"
 #include "tinynav_cpp/kernels/pose_graph_solver.hpp"
@@ -64,13 +67,181 @@
 #include "tinynav_cpp/mapping/map_v2.hpp"
 #include "tinynav_cpp/mapping/path_prior.hpp"
 #include "tinynav_cpp/mapping/vlad.hpp"
+#include "tinynav_cpp/planning/planning.hpp"
 #include "tinynav_cpp/trt/models.hpp"
 
 namespace tinynav {
 
+namespace {
+// One-shot npy writer for the save-time files (final shapes are known
+// upfront; LiveCapture's GrowFile placeholder headers are for appends).
+void write_npy_file(const std::string& path, const char* descr,
+                    const std::vector<int64_t>& shape, const void* data,
+                    size_t bytes) {
+    std::ofstream out(path, std::ios::binary);
+    const std::string header = mapping::detail::live_npy_header(descr, shape);
+    out.write(header.data(), static_cast<std::streamsize>(header.size()));
+    out.write(static_cast<const char*>(data), static_cast<std::streamsize>(bytes));
+}
+
+void write_npy_f32(const std::string& path, const std::vector<int64_t>& shape,
+                   const std::vector<float>& data) {
+    write_npy_file(path, "<f4", shape, data.data(), data.size() * sizeof(float));
+}
+
+void write_npy_f64(const std::string& path, const std::vector<int64_t>& shape,
+                   const std::vector<double>& data) {
+    write_npy_file(path, "<f8", shape, data.data(), data.size() * sizeof(double));
+}
+
+// Port of build_map_node.py::generate_occupancy_map — per-keyframe local
+// raycast (the njit run_raycasting_loopy both planning_node and the builder
+// call, with the builder's filter_ground=True), block-merge into a global
+// grid, seed-distance SDF, then the >0=occupied / <0=free typing. The 2D png
+// the python also emits is a viewer artifact, not part of map format v2.
+// The SDF is a brute-force distance to the (few hundred) trajectory seeds —
+// the python swaps in a KD-tree past ~72 bytes/voxel EDT territory; at nav
+// map scales (a few M voxels) the direct loop is seconds and exact.
+struct BakedOccupancy {
+    std::vector<uint8_t> grid;
+    std::vector<float> sdf;
+    Eigen::Vector3i shape;
+    Eigen::Vector3d origin;
+    Eigen::Vector3i raycast_shape;
+};
+
+BakedOccupancy bake_occupancy(
+    const mapping::LiveCapture& live,
+    const std::map<int64_t, Eigen::Matrix4d>& poses,
+    const std::vector<int64_t>& timestamps, const Eigen::Matrix3d& K) {
+    constexpr double kResolution = 0.1;
+    constexpr int kStep = 10;  // save_mapping's occupancy_step
+    const Eigen::Vector3i kRaycastShape(100, 100, 20);
+
+    Eigen::Vector3d mn = Eigen::Vector3d::Constant(
+        std::numeric_limits<double>::infinity());
+    Eigen::Vector3d mx = Eigen::Vector3d::Constant(
+        -std::numeric_limits<double>::infinity());
+    for (const auto& [t, pose] : poses) {
+        mn = mn.cwiseMin(pose.block<3, 1>(0, 3));
+        mx = mx.cwiseMax(pose.block<3, 1>(0, 3));
+    }
+    mn = (mn.array() / kResolution).floor() * kResolution;
+    mx = (mx.array() / kResolution).ceil() * kResolution;
+    BakedOccupancy out;
+    out.raycast_shape = kRaycastShape;
+    const Eigen::Vector3i cells =
+        ((mx - mn).array() / kResolution).ceil().cast<int>();
+    out.shape = cells + kRaycastShape;
+    out.origin = mn - 0.5 * kRaycastShape.cast<double>() * kResolution;
+
+    const int nx = out.shape[0], ny = out.shape[1], nz = out.shape[2];
+    std::vector<float> global(static_cast<size_t>(nx) * ny * nz, 0.0f);
+    std::vector<Eigen::Vector3d> seed_positions;
+
+    for (const int64_t t : timestamps) {
+        const auto it = poses.find(t);
+        if (it == poses.end()) continue;
+        const Eigen::Matrix4d& pose = it->second;
+        const cv::Mat depth = live.get_depth(t);
+        if (depth.empty()) continue;
+        const Eigen::Map<const Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic,
+                                             Eigen::RowMajor>>
+            depth_eig(reinterpret_cast<const float*>(depth.data), depth.rows,
+                      depth.cols);
+        const Eigen::Vector3d half_span =
+            0.5 * kRaycastShape.cast<double>() * kResolution;
+        const Eigen::Vector3d local_origin =
+            ((pose.block<3, 1>(0, 3).array() / kResolution).floor() * kResolution)
+                .matrix() -
+            half_span;
+        const planning::OccupancyGrid3D local = planning::run_raycasting_loopy(
+            depth_eig, pose, kRaycastShape, K(0, 0), K(1, 1), K(0, 2), K(1, 2),
+            local_origin, kStep, kResolution, /*filter_ground=*/true);
+        Eigen::Vector3i off;
+        for (int k = 0; k < 3; ++k) {
+            off[k] = static_cast<int>(
+                std::llround((local_origin[k] - out.origin[k]) / kResolution));
+        }
+        for (int x = 0; x < nx; ++x) {
+            const int lx = x - off[0];
+            if (lx < 0 || lx >= kRaycastShape[0]) continue;
+            for (int y = 0; y < ny; ++y) {
+                const int ly = y - off[1];
+                if (ly < 0 || ly >= kRaycastShape[1]) continue;
+                size_t g = (static_cast<size_t>(x) * ny + y) * nz + off[2];
+                for (int z = 0; z < nz; ++z, ++g) {
+                    const int lz = z - off[2];
+                    if (lz >= 0 && lz < kRaycastShape[2]) {
+                        global[g] += static_cast<float>(local(lx, ly, lz));
+                    }
+                }
+            }
+        }
+        seed_positions.push_back(pose.block<3, 1>(0, 3));
+    }
+
+    // SDF: distance to the nearest trajectory seed, in the same index-space
+    // metric the python uses (seeds snapped to voxel centres, then scaled).
+    out.sdf.assign(global.size(), std::numeric_limits<float>::infinity());
+    if (!seed_positions.empty()) {
+        std::vector<Eigen::Vector3d> seeds;
+        for (const auto& p : seed_positions) {
+            Eigen::Vector3i idx;
+            for (int k = 0; k < 3; ++k) {
+                idx[k] = std::clamp(static_cast<int>(
+                                        std::llround((p[k] - out.origin[k]) / kResolution)),
+                                    0, out.shape[k] - 1);
+            }
+            seeds.push_back(idx.cast<double>() * kResolution);
+        }
+        for (int x = 0; x < nx; ++x) {
+            for (int y = 0; y < ny; ++y) {
+                size_t g = (static_cast<size_t>(x) * ny + y) * nz;
+                for (int z = 0; z < nz; ++z, ++g) {
+                    const Eigen::Vector3d point =
+                        Eigen::Vector3d(x, y, z).cast<double>() * kResolution;
+                    double best = std::numeric_limits<double>::infinity();
+                    for (const auto& s : seeds) {
+                        best = std::min(best, (point - s).squaredNorm());
+                    }
+                    out.sdf[g] = static_cast<float>(std::sqrt(best));
+                }
+            }
+        }
+    }
+
+    out.grid.resize(global.size(), 0);  // 0 = unknown
+    for (size_t i = 0; i < global.size(); ++i) {
+        if (global[i] > 0.0f) {
+            out.grid[i] = 2;  // occupied
+        } else if (global[i] < 0.0f) {
+            out.grid[i] = 1;  // free
+        }
+    }
+    return out;
+}
+}  // namespace
+
 class MappingComponent : public rclcpp::Node {
   public:
-    ~MappingComponent() override { live_.close(); }  // flush the live npys
+    ~MappingComponent() override {
+        // SIGINT mid-recording = build_map_live's Ctrl+C: save before the
+        // capture files close, so an interrupted session still yields a map.
+        if (recording_) {
+            recording_ = false;
+            std::string message;
+            try {
+                if (!save_map_v2(message)) {
+                    RCLCPP_ERROR(get_logger(), "save on shutdown failed: %s",
+                                 message.c_str());
+                }
+            } catch (const std::exception& e) {
+                RCLCPP_ERROR(get_logger(), "save on shutdown threw: %s", e.what());
+            }
+        }
+        live_.close();  // flush the live npys
+    }
     explicit MappingComponent(const rclcpp::NodeOptions& options)
         : Node("map_node", options) {
         std::string model_dir = "/tinynav/tinynav/models";
@@ -82,10 +253,14 @@ class MappingComponent : public rclcpp::Node {
         // scratch lives under the gitignored fixtures/ — a run from the repo
         // root must never drop an untracked dir into the work tree
         declare_parameter<std::string>("live_capture_dir", "fixtures/nav_temp_v2");
+        // Online-build output dir (map format v2). /mapping/start points the
+        // live capture here, /mapping/stop writes the v2 file set beside it.
+        declare_parameter<std::string>("map_save_path", "output/map_cpp_v2");
         model_dir = get_parameter("model_dir").as_string();
         map_path = get_parameter("map_path").as_string();
         climb_prior_ = get_parameter("climb_prior").as_bool();
         live_.set_dir(get_parameter("live_capture_dir").as_string());
+        map_save_path_ = get_parameter("map_save_path").as_string();
 
         super_point_extractor_ = std::make_unique<trt::SuperPointTRT>(model_dir);
         light_glue_matcher_ = std::make_unique<trt::LightGlueTRT>(model_dir);
@@ -128,6 +303,23 @@ class MappingComponent : public rclcpp::Node {
             [this](sensor_msgs::msg::CameraInfo::ConstSharedPtr msg) { info_callback(*msg); });
 
         load_map(map_path);
+
+        // Online-build start/stop (std_srvs/Trigger both ways). The callbacks
+        // run in this node's default MutuallyExclusive group, so they never
+        // race the keyframe/odom callbacks — recording_ needs no atomics and
+        // a stop-time save blocks only this component's own callbacks.
+        start_srv_ = create_service<std_srvs::srv::Trigger>(
+            "/mapping/start",
+            [this](const std_srvs::srv::Trigger::Request::SharedPtr,
+                   const std_srvs::srv::Trigger::Response::SharedPtr res) {
+                start_recording(*res);
+            });
+        stop_srv_ = create_service<std_srvs::srv::Trigger>(
+            "/mapping/stop",
+            [this](const std_srvs::srv::Trigger::Request::SharedPtr,
+                   const std_srvs::srv::Trigger::Response::SharedPtr res) {
+                stop_recording(*res);
+            });
 
         poi_pub_ = create_publisher<nav_msgs::msg::Odometry>("/mapping/poi", 10);
         poi_change_pub_ = create_publisher<nav_msgs::msg::Odometry>("/mapping/poi_change", 10);
@@ -203,7 +395,10 @@ class MappingComponent : public rclcpp::Node {
         if (descr_pos == std::string::npos || shape_pos == std::string::npos) return false;
         const bool is_f32 = header.find("<f4", descr_pos) != std::string::npos;
         const bool is_f64 = header.find("<f8", descr_pos) != std::string::npos;
-        if (!is_f32 && !is_f64) return false;
+        // u1: map format v2 stores occupancy_grid.npy as uint8 (both the
+        // python exporter and the online save do).
+        const bool is_u1 = header.find("|u1", descr_pos) != std::string::npos;
+        if (!is_f32 && !is_f64 && !is_u1) return false;
         const bool fortran = header.find("True", header.find("'fortran_order'")) != std::string::npos;
         if (fortran) return false;  // every writer here saves C-order
 
@@ -223,6 +418,11 @@ class MappingComponent : public rclcpp::Node {
         if (is_f32) {
             std::vector<float> raw(total);
             in.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(total * sizeof(float)));
+            if (!in) return false;
+            for (size_t i = 0; i < total; ++i) data[i] = raw[i];
+        } else if (is_u1) {
+            std::vector<uint8_t> raw(total);
+            in.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(total));
             if (!in) return false;
             for (size_t i = 0; i < total; ++i) data[i] = raw[i];
         } else {
@@ -395,6 +595,12 @@ class MappingComponent : public rclcpp::Node {
     void keyframe_mapping(const Image& keyframe_image_msg,
                           const nav_msgs::msg::Odometry& keyframe_odom_msg,
                           const Image& depth_msg) {
+        // /mapping/start gate, build mode only: before start (or after stop)
+        // keyframes are dropped untouched — no cv_bridge copies, no
+        // SuperPoint/DINOv2 inference, no capture appends. Nav mode (map
+        // loaded) must keep running keyframe_mapping: the reloc path reads
+        // latest_keyframe_features_ and the live capture it maintains here.
+        if (!recording_ && !relocalization_enabled_) return;
         if (!K_.has_value()) return;
         const int64_t keyframe_image_timestamp = stamp_to_ns(keyframe_image_msg.header.stamp);
         const int64_t keyframe_odom_timestamp = stamp_to_ns(keyframe_odom_msg.header.stamp);
@@ -435,13 +641,25 @@ class MappingComponent : public rclcpp::Node {
                                  static_cast<long>(keyframe_image_timestamp));
         } else if (dinov2_model_->available()) {
             // Embedding only when the frame actually persisted: find_loop's
-            // candidates must never point at a missing store entry.
+            // candidates must never point at a missing store entry. One
+            // inference yields the global embedding (find_loop) AND the patch
+            // tokens, which land beside the capture like build_map_node's
+            // db.patch_tokens — they are the raw material for the VLAD index
+            // trained at save time.
             std::vector<float> embedding;
-            if (dinov2_model_->infer(image, embedding)) {
+            cv::Mat patch_tokens;
+            if (dinov2_model_->infer_global_and_patch_tokens(image, embedding,
+                                                             patch_tokens)) {
                 embeddings_[keyframe_image_timestamp] =
                     Eigen::Map<Eigen::VectorXf>(embedding.data(),
                                                 static_cast<Eigen::Index>(embedding.size()))
                         .cast<double>();
+                if (!live_.append_tokens(keyframe_image_timestamp, patch_tokens)) {
+                    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+                                         "patch token append failed: keyframe %ld "
+                                         "stays outside the VLAD index",
+                                         static_cast<long>(keyframe_image_timestamp));
+                }
             }
         } else {
             RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
@@ -547,6 +765,241 @@ class MappingComponent : public rclcpp::Node {
         }
     }
 
+    // Online-build control (std_srvs/Trigger on /mapping/start | /mapping/stop).
+    void start_recording(std_srvs::srv::Trigger::Response& res) {
+        if (relocalization_enabled_) {
+            res.success = false;
+            res.message = "map loaded: nav mode, online recording unavailable";
+            return;
+        }
+        if (recording_) {
+            res.success = false;
+            res.message = "already recording";
+            return;
+        }
+        odom_.clear();
+        pose_graph_used_pose_.clear();
+        relative_pose_constraint_.clear();
+        embeddings_.clear();
+        latest_keyframe_features_ = {-1, Features{}};
+        last_keyframe_timestamp_.reset();
+        last_keyframe_image_.release();
+        // Capture lands directly in the output dir: the v2 file set written
+        // at stop completes it in place (the capture npys ARE the map's
+        // depth/features/patch_tokens — nothing is copied or re-encoded).
+        live_.set_dir(map_save_path_);
+        live_.reset();
+        recording_ = true;
+        RCLCPP_INFO(get_logger(), "online recording started -> %s",
+                    map_save_path_.c_str());
+        res.success = true;
+        res.message = "recording into " + map_save_path_;
+    }
+
+    void stop_recording(std_srvs::srv::Trigger::Response& res) {
+        if (!recording_) {
+            res.success = false;
+            res.message = "not recording";
+            return;
+        }
+        // Gate first: keyframes arriving while the save runs are dropped
+        // untouched (that is the "resources to the global optimization" part).
+        recording_ = false;
+        std::string message;
+        try {
+            res.success = save_map_v2(message);
+        } catch (const std::exception& e) {
+            // A service callback must never throw through — the process dying
+            // here would take the whole stack down mid-session.
+            res.success = false;
+            message = std::string("save failed: ") + e.what();
+        }
+        res.message = message;
+    }
+
+    // Port of build_map_node.py::save_mapping — final pose-graph solve
+    // (max_iteration_num 1024), poses / intrinsics / path priors / VLAD index
+    // / occupancy bake, all into the capture directory (map format v2).
+    bool save_map_v2(std::string& message) {
+        if (!K_.has_value()) {
+            message = "no camera intrinsics received, nothing to save";
+            return false;
+        }
+        if (pose_graph_used_pose_.empty()) {
+            message = "no keyframes captured";
+            return false;
+        }
+        const size_t n = pose_graph_used_pose_.size();
+        RCLCPP_INFO(get_logger(), "saving map v2: %zu keyframes", n);
+
+        // Final global solve — the online loop runs max_iter=5 per loop
+        // closure, save_mapping re-solves with the default 1024.
+        if (!relative_pose_constraint_.empty()) {
+            kernels::CameraPoses cameras;
+            for (const auto& [t, pose] : pose_graph_used_pose_) cameras[t] = pose;
+            const int64_t min_timestamp =
+                std::min_element(cameras.begin(), cameras.end(),
+                                 [](const auto& a, const auto& b) { return a.first < b.first; })
+                    ->first;
+            kernels::ConstantPoseIndex constant{{min_timestamp, true}};
+            std::vector<kernels::RelativePoseConstraint> constraints;
+            for (const auto& [curr, prev, T] : relative_pose_constraint_) {
+                constraints.push_back({curr, prev, T, Eigen::Vector3d(10.0, 10.0, 10.0),
+                                       Eigen::Vector3d(30.0, 30.0, 30.0)});
+            }
+            const kernels::CameraPoses solved =
+                kernels::pose_graph_solve(cameras, constraints, constant, 1024);
+            for (const auto& [t, pose] : solved) pose_graph_used_pose_[t] = pose;
+        }
+
+        // Sorted poses (std::map order == capture order; keyframes arrive
+        // chronologically). Row-major [N,4,4] bytes for the npy.
+        std::vector<int64_t> timestamps;
+        std::vector<double> pose_bytes;
+        timestamps.reserve(n);
+        pose_bytes.reserve(n * 16);
+        for (const auto& [t, pose] : pose_graph_used_pose_) {
+            timestamps.push_back(t);
+            for (int r = 0; r < 4; ++r) {
+                for (int c = 0; c < 4; ++c) {
+                    pose_bytes.push_back(pose(r, c));
+                }
+            }
+        }
+        std::vector<int64_t> pose_shape = {static_cast<int64_t>(n), 4, 4};
+        write_npy_file(map_save_path_ + "/pose_timestamps.npy", "<i8", {static_cast<int64_t>(n)},
+                       timestamps.data(), timestamps.size() * sizeof(int64_t));
+        write_npy_f64(map_save_path_ + "/pose_matrices.npy", pose_shape, pose_bytes);
+
+        std::vector<double> k_bytes;
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) k_bytes.push_back((*K_)(r, c));
+        }
+        write_npy_f64(map_save_path_ + "/intrinsics.npy", {3, 3}, k_bytes);
+
+        // Capture-speed and climb priors (pure functions of the poses).
+        // Row-major byte loops everywhere: Eigen's default storage is
+        // column-major and an npy is C-order.
+        const auto to_f32_rows = [](const Eigen::MatrixXd& m) {
+            std::vector<float> out(static_cast<size_t>(m.rows()) * m.cols());
+            for (int r = 0; r < m.rows(); ++r) {
+                for (int c = 0; c < m.cols(); ++c) {
+                    out[static_cast<size_t>(r) * m.cols() + c] =
+                        static_cast<float>(m(r, c));
+                }
+            }
+            return out;
+        };
+        write_npy_f32(map_save_path_ + "/path_speed.npy", {static_cast<int64_t>(n), 4},
+                      to_f32_rows(mapping::compute_path_speed(pose_graph_used_pose_)));
+        write_npy_f32(map_save_path_ + "/path_climb.npy", {static_cast<int64_t>(n), 4},
+                      to_f32_rows(mapping::compute_path_climb(pose_graph_used_pose_)));
+
+        // VLAD index: stream-train the vocabulary over the persisted patch
+        // tokens (5 epochs, reshuffled per epoch like the python factory),
+        // then one descriptor per keyframe.
+        size_t vlad_missing = 0;
+        if (live_.has_tokens()) {
+            // Epoch order is reshuffled per factory call from one advancing
+            // rng (the python vlad_batch_iterator does the same). The iterator
+            // must OWN its shuffled copy — a by-reference capture of the
+            // factory's local would die with the factory, per epoch. live_ and
+            // vlad_missing outlive the training call, so those stay by ref.
+            mapping::TokenIteratorFactory factory =
+                [&, rng = std::mt19937_64(42)]() mutable -> mapping::TokenIterator {
+                std::vector<int64_t> order = timestamps;
+                std::shuffle(order.begin(), order.end(), rng);
+                size_t i = 0;
+                return [this, &vlad_missing, order, i](
+                           Eigen::MatrixXd& out) mutable -> bool {
+                    while (i < order.size()) {
+                        if (live_.get_tokens(order[i], out)) {
+                            ++i;
+                            return true;
+                        }
+                        ++i;
+                        ++vlad_missing;
+                    }
+                    return false;
+                };
+            };
+            const Eigen::MatrixXd centres = mapping::train_vocabulary_streaming(factory);
+            const int64_t dim = centres.rows() * centres.cols();
+            std::vector<float> centres_bytes =
+                to_f32_rows(centres);  // row-major, like every npy here
+            write_npy_f32(map_save_path_ + "/vlad_centres.npy",
+                          {centres.rows(), centres.cols()}, centres_bytes);
+            std::vector<float> descriptors(static_cast<size_t>(n) * dim, 0.0f);
+            for (size_t i = 0; i < n; ++i) {
+                Eigen::MatrixXd tokens;
+                if (!live_.get_tokens(timestamps[i], tokens)) continue;
+                const Eigen::VectorXd descriptor =
+                    mapping::compute_vlad(tokens, centres);
+                for (int64_t k = 0; k < dim; ++k) {
+                    descriptors[static_cast<size_t>(i) * dim + k] =
+                        static_cast<float>(descriptor[k]);
+                }
+            }
+            write_npy_f32(map_save_path_ + "/vlad_descriptors.npy",
+                          {static_cast<int64_t>(n), dim}, descriptors);
+            if (vlad_missing > 0) {
+                RCLCPP_WARN(get_logger(),
+                            "%zu keyframes have no patch tokens; their VLAD "
+                            "rows are zero (DINOv2 gap during capture)",
+                            vlad_missing);
+            }
+        } else {
+            RCLCPP_WARN(get_logger(),
+                        "no patch tokens captured — skipping the VLAD index; "
+                        "this directory will NOT load for relocalization");
+            message = "saved without a VLAD index (no patch tokens); ";
+        }
+
+        // Occupancy bake reads depth rows back through the live mmap —
+        // strictly before close().
+        const BakedOccupancy baked = bake_occupancy(live_, pose_graph_used_pose_,
+                                                    timestamps, *K_);
+        write_npy_file(map_save_path_ + "/occupancy_grid.npy", "|u1",
+                       {baked.shape[0], baked.shape[1], baked.shape[2]},
+                       baked.grid.data(), baked.grid.size());
+        write_npy_file(map_save_path_ + "/sdf_map.npy", "<f4",
+                       {baked.shape[0], baked.shape[1], baked.shape[2]},
+                       baked.sdf.data(), baked.sdf.size() * sizeof(float));
+        const std::vector<float> occupancy_meta = {
+            static_cast<float>(baked.origin[0]), static_cast<float>(baked.origin[1]),
+            static_cast<float>(baked.origin[2]), 0.1f};
+        write_npy_f32(map_save_path_ + "/occupancy_meta.npy", {4}, occupancy_meta);
+
+        // Flush the capture npys last (they are part of the map: depth,
+        // features, patch_tokens, offsets, timestamps).
+        live_.close();
+
+        // Full-format meta (overwrites LiveCapture's capture meta).
+        const std::string meta_body =
+            "{\"format\": \"tinynav_map_v2\", \"version\": 2, "
+            "\"source\": \"cpp_online_save\", \"depth_dtype\": \"u2_mm\", "
+            "\"count\": " + std::to_string(n) +
+            ", \"depth_height\": " + std::to_string(live_.depth_height()) +
+            ", \"depth_width\": " + std::to_string(live_.depth_width()) +
+            ", \"desc_dim\": " + std::to_string(live_.desc_dim()) +
+            ", \"vlad_dim\": " +
+            std::to_string(live_.has_tokens() ? live_.token_cols() * 32 : 0) +
+            ", \"vlad_centres\": " + std::to_string(live_.has_tokens() ? 32 : 0) +
+            ", \"feature_rows\": " + std::to_string(live_.feature_rows()) +
+            ", \"grid_shape\": [" + std::to_string(baked.shape[0]) + ", " +
+            std::to_string(baked.shape[1]) + ", " +
+            std::to_string(baked.shape[2]) + "]}";
+        std::ofstream meta(map_save_path_ + "/meta.json");
+        meta << meta_body;
+
+        RCLCPP_INFO(get_logger(),
+                    "map v2 saved -> %s (%zu keyframes, grid %dx%dx%d)",
+                    map_save_path_.c_str(), n, baked.shape[0], baked.shape[1],
+                    baked.shape[2]);
+        message += "saved " + std::to_string(n) + " keyframes to " + map_save_path_;
+        return true;
+    }
+
     // The Python hardcodes np.array([848,480]) (the real D435 size) at both
     // match_keypoints call sites regardless of the actual keyframe size, and
     // the LightGlue engine's keypoint normalization is sensitive to it —
@@ -643,7 +1096,13 @@ class MappingComponent : public rclcpp::Node {
 
     // Port of keyframe_relocalization.
     bool keyframe_relocalization(const std_msgs::msg::Header& header, const cv::Mat& image) {
-        if (!K_.has_value() || !map_K_.has_value() || map_index_.timestamps.empty()) return false;
+        if (!K_.has_value() || !map_K_.has_value() || map_index_.timestamps.empty()) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+                                 "reloc query gated: K=%d map_K=%d map_ts=%zu",
+                                 K_.has_value(), map_K_.has_value(),
+                                 map_index_.timestamps.size());
+            return false;
+        }
         const int64_t timestamp_ns = stamp_to_ns(header.stamp);
         Features features;
         if (latest_keyframe_features_.first == timestamp_ns) {
@@ -714,6 +1173,10 @@ class MappingComponent : public rclcpp::Node {
         }
         if (candidates.empty()) {
             RCLCPP_DEBUG(get_logger(), "VLAD: no relocalization candidates");
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 10000,
+                                 "VLAD: no reloc candidates (best similarity %.4f < %.2f)",
+                                 scored.empty() ? -2.0 : scored.back().second,
+                                 kRelocSimilarityThreshold);
             return {false, Eigen::Matrix4d::Identity(), -std::numeric_limits<double>::infinity()};
         }
 
@@ -760,8 +1223,9 @@ class MappingComponent : public rclcpp::Node {
                 }
             }
             if (static_cast<int>(pts2d.size()) <= 80) {
-                RCLCPP_DEBUG(get_logger(), "not enough landmarks to relocalize, %zu",
-                             pts2d.size());
+                RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 10000,
+                                     "not enough landmarks to relocalize, %zu",
+                                     pts2d.size());
                 continue;
             }
             Eigen::MatrixX3d pts3d_mat(static_cast<int>(pts3d.size()), 3);
@@ -773,13 +1237,19 @@ class MappingComponent : public rclcpp::Node {
             pnp_candidates.emplace_back(std::move(pts3d_mat), std::move(pts2d_mat));
         }
         if (pnp_candidates.empty()) {
-            RCLCPP_DEBUG(get_logger(), "no valid PnP relocalization candidate found");
+            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 10000,
+                                 "no valid PnP relocalization candidate found");
             return {false, Eigen::Matrix4d::Identity(), -std::numeric_limits<double>::infinity()};
         }
         const core::PnpRerankResult rerank = core::rerank_by_pnp_inliers(pnp_candidates, *K_);
         if (!rerank.success) {
+            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 10000,
+                                 "PnP rerank failed on %zu candidates",
+                                 pnp_candidates.size());
             return {false, Eigen::Matrix4d::Identity(), -std::numeric_limits<double>::infinity()};
         }
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 10000,
+                             "reloc hit: inlier ratio %.2f", rerank.inlier_ratio);
         return {true, rerank.pose, rerank.inlier_ratio};
     }
 
@@ -1393,6 +1863,13 @@ class MappingComponent : public rclcpp::Node {
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr continuous_odom_sub_;
     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr pois_sub_;
     rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr camera_info_sub_;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr start_srv_;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr stop_srv_;
+    // Guarded by the node's default MutuallyExclusive callback group: the
+    // service, sync and odom callbacks never run concurrently, so a plain
+    // bool is the whole synchronization story.
+    bool recording_ = false;
+    std::string map_save_path_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pose_graph_trajectory_pub_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr relocation_pub_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr current_pose_in_map_pub_;
