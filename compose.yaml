@@ -2,7 +2,7 @@ name: tinynav-sim
 
 services:
   tinynav:
-    image: ${TINYNAV_BASE_IMAGE:-docker.1ms.run/uniflexai/tinynav@sha256:96f802435261b774da2a72d7c965aa50137195491adc295a345bde0b0c06afa2}
+    image: ${TINYNAV_BASE_IMAGE:-uniflexai/tinynav@sha256:96f802435261b774da2a72d7c965aa50137195491adc295a345bde0b0c06afa2}
     container_name: tinynav-sim
     entrypoint: /usr/local/bin/tinynav-sim
     command: idle
