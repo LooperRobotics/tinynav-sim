@@ -7,6 +7,9 @@ services:
     entrypoint: /usr/local/bin/tinynav-sim
     command: idle
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    group_add:
+      - "${VIDEO_GID:-44}"
+      - "${RENDER_GID:-109}"
     init: true
     gpus: all
     network_mode: host
@@ -17,8 +20,9 @@ services:
       BASH_ENV: /workspace/tinynav-sim/docker/shell-env.sh
       COLCON_LOG_PATH: /workspace/tinynav-sim/.container/log
       COLCON_DEFAULTS_FILE: /workspace/tinynav-sim/docker/colcon-defaults.yaml
-      DISPLAY: ${DISPLAY:-:0}
+      DISPLAY: ${DISPLAY:-}
       XDG_RUNTIME_DIR: /run/user/${HOST_UID:-1000}
+      NVIDIA_DRIVER_CAPABILITIES: all
       GS_PLAYGROUND_ROOT: /workspace/gs_playground
     volumes:
       - .:/workspace/tinynav-sim

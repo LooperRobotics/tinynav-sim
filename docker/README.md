@@ -8,6 +8,9 @@ docker compose up -d
 docker exec -it tinynav-sim bash
 ```
 
+若宿主用户或显卡设备组不是示例值，按 `id` 和 `getent group render` 修改 `.env`
+中的 `HOST_GID`、`VIDEO_GID`、`RENDER_GID`。
+
 进入容器后直接使用：
 
 ```bash
