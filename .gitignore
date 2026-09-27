@@ -11,6 +11,11 @@ __pycache__/
 .cache/
 tmp_probe/
 
+# local container configuration and externally supplied model engines
+.env
+models/
+.container/
+
 # compiled probe binaries (tools/probes/build.sh outputs next to sources)
 /tools/probes/probe_lg
 /tools/probes/probe_lg_race

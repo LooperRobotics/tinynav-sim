@@ -62,6 +62,7 @@ SESSION=tinynav_sim
 # output/, logs/. All old /tinynav + tool/simulator paths derive from these.
 SIM_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WS_ROOT="$(dirname "$SIM_ROOT")"
+TINYNAV_INSTALL_PREFIX=${TINYNAV_INSTALL_PREFIX:-$WS_ROOT/install}
 # Python nodes run from the reference snapshot: reference/ first on PYTHONPATH
 # makes tinynav.core resolve to reference/tinynav/core (a namespace package --
 # no __init__.py there on purpose, so tinynav.tinynav_cpp_bind still resolves
@@ -73,7 +74,14 @@ export PYTHONPATH="$WS_ROOT/reference:${PYTHONPATH}"
 # Jazzy breaks cross-distro type matching. CYCLONEDDS_URI stays unset for
 # plain local runs (default config suffices on one machine); export it to
 # pin the USB-link unicast peers (src/tinynav_cpp/config/cyclonedds_x86.xml).
-export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}"
+if [[ -z ${RMW_IMPLEMENTATION:-} ]]; then
+  if ros2 pkg prefix rmw_cyclonedds_cpp >/dev/null 2>&1; then
+    export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+  else
+    export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    echo "INFO: rmw_cyclonedds_cpp is unavailable; using rmw_fastrtps_cpp for local simulation"
+  fi
+fi
 # The image ENV bakes CYCLONEDDS_URI to /tinynav/scripts/cyclone_dds_localhost.xml,
 # which no longer exists in the rig container — every rmw_cyclonedds node then
 # dies at domain creation ("can't open configuration file"). Clear it for plain
@@ -118,8 +126,8 @@ if [[ $STACK == cpp ]] && [[ -n $AUTO_SCENE ]]; then
   echo "--stack cpp conflicts with --auto: the cpp launch is self-contained and takes no scene args"; exit 1
 fi
 # cpp + --map is allowed: the map v2 dir goes to the launch as map_path.
-if [[ $STACK == cpp && ! -f $WS_ROOT/install/setup.bash ]]; then
-  echo "--stack cpp needs $WS_ROOT/install/setup.bash -- colcon build first (see gazebo/README.md)"; exit 1
+if [[ $STACK == cpp && ! -f $TINYNAV_INSTALL_PREFIX/setup.bash ]]; then
+  echo "--stack cpp needs $TINYNAV_INSTALL_PREFIX/setup.bash -- colcon build first (see gazebo/README.md)"; exit 1
 fi
 # keyboard_teleop needs pynput, which the image does not ship (the old uv-run
 # flow synced it from uv.lock). Warn once here instead of a dead tmux pane.
@@ -236,7 +244,7 @@ win() {
   tmux set-option -w -t "$SESSION:$1" automatic-rename off
   # The image's bashrc resets the environment: re-export what the windows need
   # explicitly, BEFORE the window command runs.
-  tmux send-keys -t "$SESSION:$1" "export PYTHONPATH=\"$PYTHONPATH\" IGN_GAZEBO_RESOURCE_PATH=\"$IGN_GAZEBO_RESOURCE_PATH\" TINYNAV_DB_PATH=\"$TINYNAV_DB_PATH\" RMW_IMPLEMENTATION=\"$RMW_IMPLEMENTATION\" CYCLONEDDS_URI=\"\"" Enter
+  tmux send-keys -t "$SESSION:$1" "source \"$WS_ROOT/docker/shell-env.sh\"; export PYTHONPATH=\"$PYTHONPATH\" IGN_GAZEBO_RESOURCE_PATH=\"$IGN_GAZEBO_RESOURCE_PATH\" TINYNAV_DB_PATH=\"$TINYNAV_DB_PATH\" RMW_IMPLEMENTATION=\"$RMW_IMPLEMENTATION\" CYCLONEDDS_URI=\"\" DISPLAY=\"${DISPLAY:-}\" XAUTHORITY=\"${XAUTHORITY:-}\"" Enter
   tmux send-keys -t "$SESSION:$1" "$2" Enter
 }
 
@@ -273,7 +281,7 @@ if [[ $STACK == cpp ]]; then
   # sim_gt_reloc stays off; goals go straight to /control/target_pose.
   CPP_LAUNCH_ARGS=""
   [[ $WITH_MAP == 1 ]] && CPP_LAUNCH_ARGS="map_path:=$MAP_DIR"
-  win cpp "source $WS_ROOT/install/setup.bash && ros2 launch tinynav_cpp tinynav.launch.py $CPP_LAUNCH_ARGS 2>&1 | tee logs/cpp.log"
+  win cpp "source $TINYNAV_INSTALL_PREFIX/setup.bash && ros2 launch tinynav_cpp tinynav.launch.py $CPP_LAUNCH_ARGS 2>&1 | tee logs/cpp.log"
   # same visualization face as the full stack: the cpp nodes publish the
   # identical topic names, so the stock vis.rviz renders them unchanged
   win rviz "rviz2 -d /tinynav/docs/vis.rviz 2>&1 | tee logs/rviz.log"
@@ -314,4 +322,4 @@ fi
 
 echo "session '$SESSION' up (STACK=$STACK, ROBOT=$ROBOT, WITH_MAP=$WITH_MAP, WORLD=$WORLD_SDF, AUTO=${AUTO_SCENE:-none}):"
 tmux list-windows -t "$SESSION" -F '  #{window_index}:#{window_name}'
-echo "attach: docker exec -t tinynav tmux attach -t $SESSION   (Ctrl+B D detach)"
+echo "attach: docker exec -it tinynav-sim tmux attach -t $SESSION   (Ctrl+B D detach)"

@@ -1,0 +1,9 @@
+build:
+  build-base: .container/build
+  install-base: .container/install
+test:
+  build-base: .container/build
+  install-base: .container/install
+  test-result-base: .container/build
+test-result:
+  test-result-base: .container/build

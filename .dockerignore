@@ -1,0 +1,13 @@
+.git
+build
+install
+log
+logs
+output
+fixtures
+models
+__pycache__
+*.pyc
+.cache
+tmp_probe
+.container

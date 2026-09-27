@@ -1,0 +1,33 @@
+name: tinynav-sim
+
+services:
+  tinynav:
+    image: ${TINYNAV_BASE_IMAGE:-docker.1ms.run/uniflexai/tinynav@sha256:96f802435261b774da2a72d7c965aa50137195491adc295a345bde0b0c06afa2}
+    container_name: tinynav-sim
+    entrypoint: /usr/local/bin/tinynav-sim
+    command: idle
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    init: true
+    gpus: all
+    network_mode: host
+    ipc: host
+    working_dir: /workspace/tinynav-sim
+    environment:
+      HOME: /tmp/tinynav-home
+      BASH_ENV: /workspace/tinynav-sim/docker/shell-env.sh
+      COLCON_LOG_PATH: /workspace/tinynav-sim/.container/log
+      COLCON_DEFAULTS_FILE: /workspace/tinynav-sim/docker/colcon-defaults.yaml
+      DISPLAY: ${DISPLAY:-:0}
+      XDG_RUNTIME_DIR: /run/user/${HOST_UID:-1000}
+      GS_PLAYGROUND_ROOT: /workspace/gs_playground
+    volumes:
+      - .:/workspace/tinynav-sim
+      - ./docker/entrypoint.sh:/usr/local/bin/tinynav-sim:ro
+      - /etc/passwd:/etc/passwd:ro
+      - /etc/group:/etc/group:ro
+      - ${TINYNAV_MODELS_DIR:-../tinynav/tinynav/models}:/tinynav/tinynav/models:ro
+      - ${GS_PLAYGROUND_ROOT:-../gs_playground}:/workspace/gs_playground:ro
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - /run/user/${HOST_UID:-1000}:/run/user/${HOST_UID:-1000}:ro
+    devices:
+      - /dev/dri:/dev/dri
