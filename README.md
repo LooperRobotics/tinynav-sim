@@ -4,6 +4,20 @@ tinynav 热路径节点（perception / imu_propagator / mapping / planning）的
 单进程 rclcpp 组件 + 进程内零拷贝，以两种仿真（gzsim、3DGS）和 bag 回放作为端到端测试台。
 `reference/` 是只读 Python 快照，是移植的 spec（冲突时 Python 语义优先）。
 
+## 0. 可复现开发容器
+
+仓库提供一个统一的 GPU 开发/测试/仿真容器，不会触发基础镜像的 TRT engine
+自动生成入口：
+
+```bash
+cp .env.example .env
+docker compose up -d
+docker exec -it tinynav-sim bash
+```
+
+容器已包含编译、GPU、TensorRT 和 Gazebo 运行环境。进入后自行执行 `colcon build`
+或 `./gazebo/run_simulator.sh`。详细说明见 [`docker/README.md`](docker/README.md)。
+
 ## 1. 目录结构（每个子文件夹干什么）
 
 ```
