@@ -14,14 +14,21 @@ Renders without any window:
 
     infra1 / infra2 : 544x480 L8   (grayscale, 51 mm stereo baseline)
     color           : 544x480 RGB8
+    depth           : 544x480 u16 mm (infra1 viewpoint, ring v3; 0 = no-return)
     imu             : gyro + accelerometer + orientation @200 Hz (specific force)
     gt              : base pose @50 Hz (ring v2 ground-truth channel)
+    gt_cam          : infra1 camera world pose per camera tick (ring v3)
 
 and writes them into the shared-memory ring consumed by
 gsplat/ros/gs_ros_bridge.py, which republishes them as /camera/camera/...
 ROS 2 topics plus /sim/gt_pose. D435i intrinsics: fx = fy = 272, cx = 272,
 cy = 240 for 544x480 -- the square-pixel/centred model batch_render builds
 from fovy, so we pass fovy = 2*atan(240/272) = 82.85 deg and get pixel-exact K.
+
+For the HIL looper-emu face run e.g.
+    --cam-w 544 --cam-h 640 --cam-fy 302.779 --cams infra1
+which matches the real looper contract (544x640, fx=fy=302.779; batch_render
+forces cx=W/2, cy=H/2, so declared camera_info uses the same centred model).
 
 Usage
 -----
@@ -459,15 +466,20 @@ class StairsSupervisor:
 # rendering helpers
 # --------------------------------------------------------------------------- #
 def render_cameras(gs, model, data, cam_ids):
-    """One batch_render call for all cameras -> uint8 (N,H,W,3) on CPU."""
+    """One batch_render call for all cameras -> (uint8 (N,H,W,3), depth_mm_u16 list).
+
+    Depth is the rasterizer's expected z (metres) per requested camera; only the
+    infra1 entry is kept (the ring's single depth plane is left/infra1-aligned,
+    like the real looper's depth frame) and converted to uint16 mm on the GPU."""
     poses = [np.asarray(model.cameras[c].get_pose(data)).ravel() for c in cam_ids]
     cam_pos = np.array([p[:3] for p in poses], np.float32)
     cam_xmat = np.array([Rotation.from_quat(p[3:7]).as_matrix().flatten() for p in poses], np.float32)
     fovy = np.full(len(cam_ids), FOVY, np.float32)
     with torch.no_grad():
-        rgb, _depth = batch_render(gs.gaussians, cam_pos, cam_xmat, H, W, fovy)
+        rgb, depth = batch_render(gs.gaussians, cam_pos, cam_xmat, H, W, fovy)
         u8 = (rgb.clamp(0.0, 1.0) * 255.0).to(torch.uint8)      # convert on GPU (3x less PCIe)
-        return u8.cpu().numpy()
+        mm = (depth[..., 0].clamp(0.0, 65.535) * 1000.0).round().to(torch.uint16)
+        return u8.cpu().numpy(), mm.cpu().numpy()
 
 
 def self_cull(gs, self_slice, cam_pos, radius, state):
@@ -525,6 +537,18 @@ def main():
     ap.add_argument("--rtf", type=float, default=1.0,
                     help="real-time factor: 1 = real time, 0 = as fast as possible")
     ap.add_argument("--cam-hz", type=float, default=15.0)
+    ap.add_argument("--cam-w", type=int, default=544,
+                    help="camera width px (HIL looper contract: 544)")
+    ap.add_argument("--cam-h", type=int, default=480,
+                    help="camera height px (HIL looper contract: 640)")
+    ap.add_argument("--cam-fy", type=float, default=272.0,
+                    help="focal fy=fx px (batch_render's centred square-pixel model; "
+                         "HIL looper contract: 302.779)")
+    ap.add_argument("--cams", default="infra1,infra2,color",
+                    help="comma subset of infra1,infra2,color to render; the ring "
+                         "always carries all three planes (unrendered = zeros). "
+                         "HIL runs 'infra1' -- the contract has no infra2/color "
+                         "consumer and the budget goes to resolution instead")
     ap.add_argument("--imu-hz", type=float, default=200.0)
     ap.add_argument("--ring", default=DEFAULT_PATH)
     ap.add_argument("--no-ring", action="store_true", help="do not write the shared ring")
@@ -560,6 +584,13 @@ def main():
                          "texture upload/compositing in the viewer); the collision "
                          "viewport stays — less viewer-side CPU per frame")
     args = ap.parse_args()
+
+    global W, H, FY, FOVY
+    W, H, FY = args.cam_w, args.cam_h, args.cam_fy
+    FOVY = float(np.degrees(2.0 * np.arctan((H / 2.0) / FY)))
+    render_names = tuple(c.strip() for c in args.cams.split(",") if c.strip())
+    if not render_names or [n for n in render_names if n not in CAM_NAMES]:
+        raise SystemExit(f"--cams: {args.cams!r} (valid subset of {', '.join(CAM_NAMES)})")
 
     cfg = load_config(args.config)
     scene_file = resolve_gs_path(cfg["scene"])
@@ -774,16 +805,22 @@ def main():
             n_culled = self_cull(gs, self_slice, cam_pos0, args.self_cull, cull_state)
             t_cull = time.perf_counter() - t0
             t0 = time.perf_counter()
-            frames = render_cameras(gs, model, data, [cam_ids[n] for n in CAM_NAMES])
+            frames, depths = render_cameras(gs, model, data, [cam_ids[n] for n in render_names])
             render_ms = (time.perf_counter() - t0) * 1e3
-            infra1 = to_luma(frames[0])
-            infra2 = to_luma(frames[1])
-            color = frames[2]
-            if args.window:
+            out = {name: (frames[i] if name == "color" else to_luma(frames[i]))
+                   for i, name in enumerate(render_names)}
+            infra1 = out.get("infra1", np.zeros((H, W), np.uint8))
+            infra2 = out.get("infra2", np.zeros((H, W), np.uint8))
+            color = out.get("color", np.zeros((H, W, 3), np.uint8))
+            depth = (depths[render_names.index("infra1")] if "infra1" in render_names
+                     else np.zeros((H, W), np.uint16))
+            if ring:
+                cp = np.asarray(model.cameras[cam_ids["infra1"]].get_pose(data)).ravel()
+                ring.publish_gt_cam(sim_t, cp[:3], cp[3:7])   # before the cam_seq bump:
+                ring.publish_cameras(infra1, infra2, depth, color, sim_t)  # guarded together
+            if args.window and "color" in out:
                 from PIL import Image
                 last_color[0] = np.asarray(Image.fromarray(color).resize((480, 360)))
-            if ring:
-                ring.publish_cameras(infra1, infra2, color, sim_t)
             n_cam += 1
             if args.out and sim_t >= args.dump_after and len(dumps) < 3 and \
                     (not dumps or sim_t - dumps[-1][0] > args.dump_interval):

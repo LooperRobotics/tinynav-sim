@@ -2,29 +2,41 @@
 """Shared-memory ring for the gsplat simulator -> ROS bridge.
 
 Written during bring-up (lived in gs_playground/demo/navigation/sensors/),
-moved into tinynav-sim. Version 2 adds the ground-truth
-channel (a single base-pose slot the simulator refreshes at the control rate)
-so `gs_state.sh` and a future gs_gt_reloc have a truth source the way gz has
+moved into tinynav-sim. Version 2 added the ground-truth channel (a single
+base-pose slot the simulator refreshes at the control rate) so `gs_state.sh`
+and a future gs_gt_reloc have a truth source the way gz has
 `/world/<w>/dynamic_pose/info`.
+
+Version 3 (HIL looper-emu) adds two channels, both sized off the
+existing header fields so readers only need the version switch:
+
+  * a DEPTH plane in every camera slot (uint16 millimetres, infra1/left
+    viewpoint, 0 = no-return) -- the real looper's
+    /camera/camera/depth/image_rect_raw contract is mono16 mm;
+  * a gt_cam slot: the infra1 camera's world pose at the camera instant, for
+    the looper emulator's vio_image/vio_100hz (T_world_camera). It has no seq
+    of its own: the server writes it in the camera tick BEFORE bumping cam_seq,
+    so the existing seq guard covers cameras+depth+gt_cam together.
 
 Both sides run in the tinynav container now; the ring stays because decoupling
 the render loop from DDS pacing is still right (a slow subscriber must never
-stretch the 15 Hz camera cadence) and the restart/torn-frame protocol is
-already debugged.
+stretch the camera cadence) and the restart/torn-frame protocol is already
+debugged.
 
 Layout (little endian; header is 128 B, fixed byte offsets below):
 
     off  0  magic 'GSPG'      off 40  w          (u32)
-    off  4  version  (u32=2)  off 44  h          (u32)
+    off  4  version  (u32=3)  off 44  h          (u32)
     off  8  cam_seq  (u64)    off 48  n_imu      (u32)
     off 16  imu_seq  (u64)    off 52  imu_stride (u32)
     off 24  cam_time (f64)    off 56  gt_seq     (u64)   [v2]
     off 32  imu_time (f64)    off 64  gt_time    (f64)   [v2]
                                off 128 cam slots
 
-    cam slots : N_SLOT x [ infra1(w*h) | infra2(w*h) | color(w*h*3) ]   uint8
+    cam slots : N_SLOT x [ infra1(w*h) | infra2(w*h) | depth(w*h*2,u16) | color(w*h*3) ]   uint8
     imu ring  : N_IMU x [ t(f64) | gyro(3xf32) | accel(3xf32) | quat(4xf32) ]
-    gt slot   : [ t(f64) | pos(3xf64) | quat(4xf64) ]  (64 B, single slot)
+    gt slot   : [ t(f64) | pos(3xf64) | quat(4xf64) ]                     (64 B, single slot)
+    gt_cam    : [ t(f64) | pos(3xf64) | quat(4xf64) ]                     (64 B, single slot) [v3]
 
 Publish protocol: fill the payload, then bump the seq (written last).  A
 reader copies the payload, re-reads the seq and accepts only if unchanged ->
@@ -40,7 +52,7 @@ from dataclasses import dataclass
 import numpy as np
 
 MAGIC = b"GSPG"
-VERSION = 2
+VERSION = 3
 HDR = 128
 N_SLOT = 4
 N_IMU = 512
@@ -57,13 +69,14 @@ OFF_GT_SEQ, OFF_GT_TIME = 56, 64
 
 
 def _layout(w: int, h: int, n_slot: int, n_imu: int) -> dict:
-    slot = w * h * 2 + w * h * 3
+    slot = w * h * 7              # infra1 + infra2 + depth(u16) + color
     cam_base = HDR
     imu_base = HDR + slot * n_slot
     gt_base = imu_base + IMU_STRIDE * n_imu
+    gt_cam_base = gt_base + GT_STRIDE
     return {"w": w, "h": h, "slot": slot, "n_slot": n_slot, "n_imu": n_imu,
             "cam_base": cam_base, "imu_base": imu_base, "gt_base": gt_base,
-            "size": gt_base + GT_STRIDE}
+            "gt_cam_base": gt_cam_base, "size": gt_cam_base + GT_STRIDE}
 
 
 def ring_size(w: int, h: int, n_slot: int = N_SLOT, n_imu: int = N_IMU) -> int:
@@ -94,16 +107,27 @@ class SensorRingWriter:
         struct.pack_into("<QQ", self.buf, OFF_CAM_SEQ, 0, 0)
         self.buf.flush()
 
+    def publish_gt_cam(self, sim_time: float, pos, quat) -> None:
+        """infra1 camera pose in the world frame, at the camera instant.
+
+        MUST be called before the matching publish_cameras: it is covered by
+        the cam_seq torn-frame guard rather than a seq of its own."""
+        p = self.o["gt_cam_base"]
+        struct.pack_into("<d3d4d", self.buf, p, sim_time, *pos, *quat)
+
     def publish_cameras(self, infra1: np.ndarray, infra2: np.ndarray,
-                        color: np.ndarray, sim_time: float) -> None:
+                        depth_mm_u16: np.ndarray, color: np.ndarray,
+                        sim_time: float) -> None:
         o = self.o
         w, h = o["w"], o["h"]
         n1 = w * h
         base = o["cam_base"] + (self.cam_seq % o["n_slot"]) * o["slot"]
         assert infra1.nbytes == n1 and infra2.nbytes == n1 and color.nbytes == n1 * 3
+        assert depth_mm_u16.nbytes == n1 * 2 and depth_mm_u16.dtype == np.uint16
         self.buf[base:base + n1] = infra1.reshape(-1)
         self.buf[base + n1:base + 2 * n1] = infra2.reshape(-1)
-        self.buf[base + 2 * n1:base + 5 * n1] = color.reshape(-1)
+        self.buf[base + 2 * n1:base + 4 * n1] = depth_mm_u16.reshape(-1).view(np.uint8)
+        self.buf[base + 4 * n1:base + 7 * n1] = color.reshape(-1)
         struct.pack_into("<d", self.buf, OFF_CAM_TIME, sim_time)
         self.cam_seq += 1
         struct.pack_into("<Q", self.buf, OFF_CAM_SEQ, self.cam_seq)   # publish
@@ -144,7 +168,10 @@ class CameraFrame:
     sim_time: float
     infra1: np.ndarray
     infra2: np.ndarray
+    depth: np.ndarray          # uint16 (h, w), millimetres, 0 = no-return [v3]
     color: np.ndarray
+    cam_pos: np.ndarray        # infra1 camera world position at this instant [v3]
+    cam_quat: np.ndarray       # xyzw [v3]
 
 
 @dataclass
@@ -185,15 +212,18 @@ class SensorRingReader:
         o = self.o
         n1 = self.w * self.h
         base = o["cam_base"] + ((seq - 1) % o["n_slot"]) * o["slot"]
-        blob = self.buf[base:base + 5 * n1].tobytes()        # one copy, 1.3 MB
+        blob = self.buf[base:base + 7 * n1].tobytes()        # one copy
+        cv = struct.unpack_from("<d3d4d", self.buf, o["gt_cam_base"])
         if struct.unpack_from("<Q", self.buf, OFF_CAM_SEQ)[0] != seq:
             return None                                       # torn, retry next poll
         self._last_cam = seq
         t = struct.unpack_from("<d", self.buf, OFF_CAM_TIME)[0]
         f1 = np.frombuffer(blob, np.uint8, n1, 0).reshape(self.h, self.w).copy()
         f2 = np.frombuffer(blob, np.uint8, n1, n1).reshape(self.h, self.w).copy()
-        f3 = np.frombuffer(blob, np.uint8, 3 * n1, 2 * n1).reshape(self.h, self.w, 3).copy()
-        return CameraFrame(seq, t, f1, f2, f3)
+        dep = np.frombuffer(blob, np.uint8, 2 * n1, 2 * n1).view(np.uint16).reshape(self.h, self.w).copy()
+        f3 = np.frombuffer(blob, np.uint8, 3 * n1, 4 * n1).reshape(self.h, self.w, 3).copy()
+        return CameraFrame(seq, t, f1, f2, dep, f3,
+                           np.array(cv[1:4]), np.array(cv[4:8]))
 
     def read_imu(self) -> list[ImuSample]:
         total = struct.unpack_from("<Q", self.buf, OFF_IMU_SEQ)[0]

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- HIL x86 侧 CycloneDDS 配置(实验 4)。
+     背景:FastDDS 默认 65KB 数据报×44 IP 分片,在 navcore 的 NCM gadget 接收
+     管道上负载相关丢包 → 重传风暴 → 在线录制只收 40% 帧;maxMessageSize 1400
+     (RTPS 级分片)也只能到 40%。Cyclone 的默认设计即按片 MTU 级重传
+     (MaxRexmitMessageSize 默认 1456B)+ 带宽自适应重传队列,赌它能收敛。
+     注意:容器镜像烘焙的 CYCLONEDDS_URI 是 localhost-only,必须用本文件覆盖;
+     与 navcore 侧 FastDDS 走 RTPS 互通(跨厂商兼容)。
+     用法: RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
+           CYCLONEDDS_URI=file://<this file> python3 looper_emu.py -->
+<CycloneDDS xmlns="https://cdds.io/config">
+  <Domain>
+    <General>
+      <Interfaces>
+        <!-- 只留 USB 网卡:同时列 127.0.0.1 时 Cyclone 会选中 lo 当组播口并整体
+             禁用组播 → 参与者对全网不可见(实测 sensor:True 全是
+             pilot 缓存假象,/slam 实际 0 帧)。本机探针也走 55.100 即可。 -->
+        <NetworkInterface address="192.168.55.100"/>
+      </Interfaces>
+      <!-- 全 MTU 化:首发与重传都不 IP 分片,丢一片只补一片 -->
+      <MaxMessageSize>1456B</MaxMessageSize>
+      <MaxRexmitMessageSize>1456B</MaxRexmitMessageSize>
+      <FragmentSize>1344B</FragmentSize>
+      <AllowMulticast>default</AllowMulticast>
+    </General>
+    <Internal>
+      <SocketReceiveBufferSize min="4MB"/>
+    </Internal>
+  </Domain>
+</CycloneDDS>

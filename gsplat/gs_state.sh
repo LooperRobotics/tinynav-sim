@@ -51,7 +51,10 @@ if bytes(buf[0:4]) != b"GSPG":
 gt_seq = struct.unpack_from("<Q", buf, 56)[0]
 gt_time = struct.unpack_from("<d", buf, 64)[0]
 n_imu = struct.unpack_from("<I", buf, 48)[0]
-gt_base = 128 + (544 * 480 * 5) * 4 + 48 * n_imu
+ver = struct.unpack_from("<I", buf, 4)[0]
+w, h = struct.unpack_from("<II", buf, 40)
+slot = w * h * (7 if ver >= 3 else 5)   # v3 added the u16 depth plane per slot
+gt_base = 128 + slot * 4 + 48 * n_imu
 v = struct.unpack_from("<d3d4d", buf, gt_base)
 x, y, z = v[1:4]
 qx, qy, qz, qw = v[4:8]

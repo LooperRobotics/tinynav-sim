@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- HIL x86 侧 FastDDS 白名单 + 大缓冲。
+     只在 USB 链路 (192.168.55.100) + loopback 上收发,与 navcore 侧
+     docker-compose.hil.yml 挂载的 hil_fastdds.xml (192.168.55.1) 对称。
+     大缓冲是必须的: 这台容器的旧记录是 FastDDS 默认缓冲下 783KB 彩图
+     掉到 2.5Hz (run_gsplat.sh 因此切了 CycloneDDS); HIL 契约图 544x640
+     mono8 ~349KB @12Hz + mono16 ~699KB,走 ASYNCHRONOUS 发布 + 这些缓冲。
+     用法: RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
+           FASTDDS_DEFAULT_PROFILES_FILE=<this file> python3 looper_emu.py -->
+<dds>
+  <profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+    <transport_descriptors>
+      <transport_descriptor>
+        <transport_id>hil_udp</transport_id>
+        <type>UDPv4</type>
+        <interfaceWhiteList>
+          <address>192.168.55.100</address>
+          <address>127.0.0.1</address>
+        </interfaceWhiteList>
+        <!-- MTU 适配(实验 3):默认 65KB 数据报会被 IP 拆成 44 片,
+             USB gadget 管道丢任一片整报作废 → RELIABLE 重传风暴 → 录制饿死。
+             压到 1400 后走 RTPS 级分片,每片独立、单片重传。 -->
+        <maxMessageSize>1400</maxMessageSize>
+        <sendBufferSize>1048576</sendBufferSize>
+        <receiveBufferSize>4194304</receiveBufferSize>
+      </transport_descriptor>
+      <transport_descriptor>
+        <transport_id>hil_shm</transport_id>
+        <type>SHM</type>
+      </transport_descriptor>
+    </transport_descriptors>
+    <participant profile_name="hil_participant" is_default_profile="true">
+      <rtps>
+        <userTransports>
+          <transport_id>hil_udp</transport_id>
+          <transport_id>hil_shm</transport_id>
+        </userTransports>
+        <useBuiltinTransports>false</useBuiltinTransports>
+      </rtps>
+    </participant>
+  </profiles>
+</dds>
