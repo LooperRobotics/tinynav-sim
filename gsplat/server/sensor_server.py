@@ -243,6 +243,218 @@ class Go2LocomotionPolicy:
         return float(np.dot(z_axis, np.array([0.0, 0.0, 1.0])) < 0.3)   # is_fallen
 
 
+class Go2StairsLocomotionPolicy:
+    """go2-direct-stairs v12 policy (onnx, CPU) — 60-dim obs with contact
+    channels, software PD torque control at 100 Hz.
+
+    Bit-mirrors demo/navigation/utils/go2_stairs.py (the gs_playground
+    deployment adapter, headless-verified for walk/turn/stop/stairs):
+      obs = [linvel*2, gyro*0.25, gravity, (q-default), dq*0.05, last_action,
+             cmd*[2,2,0.25], contact x12]
+      contact = first-found pair sensor (found normal, world frame) ->
+             base_R^T @ (-normal), 0 when airborne
+      torque = 100*(action*0.05 + default - q) - 1.2*dq   (motors +-24)
+    """
+
+    _DEFAULT_ANGLES = np.array([0.0, 0.9, -1.8] * 4, dtype=np.float32)  # FL,FR,RL,RR
+    _FEET = ("FR", "FL", "RR", "RL")  # training cfg.sensor.feet order
+    _CMD_SCALE = np.array([2.0, 2.0, 0.25], dtype=np.float32)
+    _KP, _KD, _ACTION_SCALE = 100.0, 1.2, 0.05
+    CTRL_DT = 0.01  # 100 Hz (vs 0.02 for the flat policy)
+
+    def __init__(self, robot, onnx_path, surface_geoms):
+        import onnxruntime as ort
+        self._robot = robot
+        self.default_angles = self._DEFAULT_ANGLES.copy()
+        self.last_action = np.zeros(12, dtype=np.float32)
+        self._contact_sensors = tuple(
+            tuple(f"{f}_cf_{g}" for g in surface_geoms) for f in self._FEET
+        )
+        self._policy_session = ort.InferenceSession(onnx_path.as_posix(),
+                                                    providers=["CPUExecutionProvider"])
+        self._input_name = self._policy_session.get_inputs()[0].name
+        self._output_name = self._policy_session.get_outputs()[0].name
+
+    def _contact_channels(self, data):
+        base_R = self._robot._body.get_rotation_mat(data)
+        cols = []
+        for names in self._contact_sensors:
+            d = np.zeros(3)
+            for name in names:
+                v = self._robot._model.get_sensor_value(name, data)
+                if float(v[0]) > 0.5:
+                    d = base_R.T @ (-np.asarray(v[1:4]))
+                    break
+            cols.append(d)
+        return np.concatenate(cols)
+
+    def get_observation(self, data, command):
+        lin_vel = self._robot.local_linear_vel(data)
+        gyro = self._robot.gyro(data)
+        gravity = self._robot.gravity(data)
+        dof_pos = self._robot.dof_pos(data)
+        dof_vel = self._robot.dof_vel(data)
+        obs = np.hstack([
+            lin_vel * 2.0,
+            gyro * 0.25,
+            gravity,
+            dof_pos - self.default_angles,
+            dof_vel * 0.05,
+            self.last_action,
+            command * self._CMD_SCALE,
+            self._contact_channels(data),
+        ])
+        return obs.astype(np.float32)
+
+    def step(self, data, command):
+        obs = self.get_observation(data, command)
+        action = self._policy_session.run(
+            [self._output_name], {self._input_name: obs.reshape(1, -1)})[0][0]
+        self._apply_action(data, action)
+        return False   # fall detection lives in StairsSupervisor
+
+    def hold(self, data):
+        """PD toward default angles with zero action (spawn settle phase).
+
+        Straight to torque, no ONNX call: reacting to the drop-in transient
+        is exactly what swings a leg back at spawn (user-visible "one foot
+        behind"), and last_action stays 0 so the first real observation
+        matches what the policy saw in training."""
+        self._apply_action(data, np.zeros(12, dtype=np.float32))
+
+    def reset_action(self):
+        self.last_action = np.zeros(12, dtype=np.float32)
+
+    def _apply_action(self, data, action):
+        dof_pos = self._robot.dof_pos(data)
+        dof_vel = self._robot.dof_vel(data)
+        torque = (self._KP * (action * self._ACTION_SCALE + self.default_angles - dof_pos)
+                  - self._KD * dof_vel)
+        self._robot.set_actuator_ctrls(data, torque.astype(np.float32))
+        self.last_action = action.astype(np.float32)
+
+
+class StairsSupervisor:
+    """Fall detection + respawn for the stairs policy in the multi-floor map.
+
+    The policy never learned to get up, and the old inline check (trunk
+    z-axis tilt) misses the common failure mode: a belly-collapsed crouch
+    keeps the z-axis up, so the dog just lay there. Height is measured over
+    the local AABB floor (ceiling = root_z - 0.05, same rule as training's
+    go2_map3._ground_hint) so it works on any storey. Respawn re-applies the
+    config spawn qpos — data.reset() would drop the robot at the MJCF origin
+    instead. The first hold_secs after every (re)spawn the policy is held
+    (see Go2StairsLocomotionPolicy.hold).
+
+    A second blind spot was fixed after user repro: a prone dog (root height
+    0.19-0.22 m) overlaps the normal idle crouch (0.218 m measured), so no
+    height threshold alone separates "collapsed and staying down" from
+    "crouched and waiting". The deadlock check therefore requires a NONZERO
+    COMMAND plus low height plus a frozen pose (neither xy nor yaw moving)
+    for deadlock_secs — a waiting dog gets zero command and never triggers;
+    an upright dog blocked at a wall has height above the band. Measured
+    references: prone 0.188, idle crouch 0.218, standing 0.277 -> the
+    default 0.235 band sits between crouch and stand.
+    """
+
+    def __init__(self, robot, surfaces_xml, spawn_qpos,
+                 fall_height: float = 0.18, fall_secs: float = 1.0,
+                 hold_secs: float = 0.5,
+                 deadlock_height: float = 0.235, deadlock_secs: float = 2.0,
+                 deadlock_disp: float = 0.05, deadlock_yaw: float = 0.15):
+        import re
+        boxes = []
+        for m in re.finditer(
+                r'<geom[^>]*?size="([\d.eE+-]+) ([\d.eE+-]+) ([\d.eE+-]+)"[^>]*?'
+                r'pos="([\d.eE+-]+) ([\d.eE+-]+) ([\d.eE+-]+)"',
+                Path(surfaces_xml).read_text()):
+            ax, ay, az, px, py, pz = map(float, m.groups())
+            boxes.append((px - ax, py - ay, px + ax, py + ay, pz + az))
+        self._boxes = np.asarray(boxes, dtype=np.float64)   # (K,5) xmin ymin xmax ymax top
+        self._robot = robot
+        self._spawn_qpos = np.asarray(spawn_qpos, dtype=np.float32).ravel().copy()
+        self._fall_height = fall_height
+        self._fall_secs = fall_secs
+        self._hold_secs = hold_secs
+        self._deadlock_height = deadlock_height
+        self._deadlock_secs = deadlock_secs
+        self._deadlock_disp = deadlock_disp
+        self._deadlock_yaw = deadlock_yaw
+        self._fall_since = None
+        self._hold_until = hold_secs        # the initial spawn drops in held too
+        self._deadlock_ref = None           # (sim_t, xy, yaw) of the window start
+        self.n_respawns = 0
+        self.n_deadlocks = 0
+
+    def _ground(self, xy, ceiling):
+        b = self._boxes
+        hit = ((xy[0] >= b[:, 0]) & (xy[0] <= b[:, 2])
+               & (xy[1] >= b[:, 1]) & (xy[1] <= b[:, 3]) & (b[:, 4] <= ceiling))
+        return float(b[hit, 4].max()) if hit.any() else -0.05
+
+    def holding(self, sim_t: float) -> bool:
+        return sim_t < self._hold_until
+
+    def check_fallen(self, data, sim_t: float) -> bool:
+        pose = self._robot.base_pose(data)
+        z = float(pose[2])
+        if not np.isfinite(z):
+            fallen = True
+        else:
+            height = z - self._ground(pose[:2], z - 0.05)
+            up = Rotation.from_quat(pose[3:7]).apply(np.array([0.0, 0.0, 1.0]))
+            fallen = float(up[2]) < 0.3 or height < self._fall_height
+        if not fallen:
+            self._fall_since = None
+            return False
+        if self._fall_since is None:
+            self._fall_since = sim_t
+        if sim_t - self._fall_since >= self._fall_secs:
+            self._fall_since = None           # re-armed; respawn follows
+            return True
+        return False
+
+    def check_deadlock(self, data, sim_t: float, cmd) -> bool:
+        """Prone-but-axis-up collapse the height/tilt checks miss (user repro:
+        the dog lay prone through a whole session with ZERO respawns).
+        Triggers only on: nonzero command + low height + frozen pose for
+        deadlock_secs. cmd is the (vx, vy, wz) command the policy is given."""
+        commanded = abs(float(cmd[0])) > 0.05 or abs(float(cmd[2])) > 0.1
+        pose = self._robot.base_pose(data)
+        z = float(pose[2])
+        low = np.isfinite(z) and (
+            z - self._ground(pose[:2], z - 0.05) < self._deadlock_height)
+        if not (commanded and low):
+            self._deadlock_ref = None
+            return False
+        yaw = float(Rotation.from_quat(pose[3:7]).as_euler("xyz")[2])
+        if self._deadlock_ref is None:
+            self._deadlock_ref = (sim_t, np.asarray(pose[:2]).copy(), yaw)
+            return False
+        t0, xy0, yaw0 = self._deadlock_ref
+        frozen = (np.linalg.norm(np.asarray(pose[:2]) - xy0) < self._deadlock_disp
+                  and abs(self._wrap(yaw - yaw0)) < self._deadlock_yaw)
+        if not frozen:
+            self._deadlock_ref = (sim_t, np.asarray(pose[:2]).copy(), yaw)
+            return False
+        if sim_t - t0 >= self._deadlock_secs:
+            self._deadlock_ref = None
+            self.n_deadlocks += 1
+            return True
+        return False
+
+    @staticmethod
+    def _wrap(a: float) -> float:
+        return (a + np.pi) % (2 * np.pi) - np.pi
+
+    def respawn(self, data, model, sim_t: float):
+        data.set_dof_pos(self._spawn_qpos, model)
+        data.set_dof_vel(np.zeros_like(data.dof_vel))
+        forward_kinematic(model, data)
+        self._hold_until = sim_t + self._hold_secs
+        self.n_respawns += 1
+
+
 # --------------------------------------------------------------------------- #
 # rendering helpers
 # --------------------------------------------------------------------------- #
@@ -355,6 +567,7 @@ def main():
     # mesh paths against the file's own directory), so it is generated INTO
     # the gs_playground checkout by gsplat/robots/go2/make_sensor_rig.py.
     rig_file = Path(args.rig_file) if args.rig_file else (
+        resolve_gs_path(cfg["rig"]) if cfg.get("rig") else
         GSPG_NAV / "models" / "robots" / "navigation" / "go2" / "go2_sensor_rig.xml")
     if not rig_file.exists():
         raise SystemExit(f"sensor rig missing: {rig_file}\n"
@@ -393,7 +606,31 @@ def main():
         print(f"initial_qpos applied ({qpos.shape[0]} dof)")
     body = model.get_body("base")
     robot = Go2Robot(body)
-    policy = Go2LocomotionPolicy(robot=robot)
+    supervisor = None
+    if cfg.get("policy") == "stairs_v12":
+        # walkable-surface geom names for the contact-channel pair sensors
+        import re as _re
+        surfaces_xml = resolve_gs_path(cfg["policy_surfaces_file"])
+        surface_geoms = _re.findall(r'<geom name="(\w+)"', surfaces_xml.read_text()) + ["floor"]
+        onnx_rel = cfg.get("policy_onnx", "policies/go2_stairs_v12.onnx")
+        policy = Go2StairsLocomotionPolicy(
+            robot=robot,
+            onnx_path=GSPG_NAV / onnx_rel,
+            surface_geoms=surface_geoms)
+        # fall detection + spawn respawn (height over the local AABB floor,
+        # tilted-trunk check, 0.5 s PD hold after every respawn; the
+        # command-motion deadlock check catches prone-but-axis-up collapses)
+        supervisor = StairsSupervisor(
+            robot, surfaces_xml, np.asarray(data.dof_pos, dtype=np.float32).ravel(),
+            fall_height=float(os.environ.get("TINYNAV_GS_FALL_HEIGHT", 0.18)),
+            deadlock_height=float(os.environ.get("TINYNAV_GS_DEADLOCK_HEIGHT", 0.235)),
+            deadlock_secs=float(os.environ.get("TINYNAV_GS_DEADLOCK_SECS", 2.0)))
+        print(f"policy: stairs ({onnx_rel}, {len(surface_geoms)} contact surfaces, "
+              f"100 Hz torque PD, {len(supervisor._boxes)} floor boxes, "
+              f"fall+deadlock supervisor on)")
+    else:
+        policy = Go2LocomotionPolicy(robot=robot)
+        print("policy: go2 flat (go2_policy.onnx, 50 Hz position)")
 
     gaussians = collect_scene_gaussians(scene_cfg)
     robot_gaussians, robot_links = collect_robot_gaussians("go2", model, robot_gs_dir)
@@ -431,7 +668,7 @@ def main():
         print(f"state : {args.state_shm} ({state_w.n_dof} dof)")
 
     dt = float(model.options.timestep)
-    n_ctrl = max(1, round(0.02 / dt))
+    n_ctrl = max(1, round(getattr(policy, "CTRL_DT", 0.02) / dt))
     cam_period, imu_period, gt_period = 1.0 / args.cam_hz, 1.0 / args.imu_hz, 1.0 / GT_HZ
     next_cam, next_imu, next_gt, next_state = 0.0, 0.0, 0.0, 0.0
     sim_t = 0.0
@@ -479,19 +716,43 @@ def main():
                 else:
                     cmd = np.array([args.drive_speed, 0.0, np.clip(1.5 * err, -1.0, 1.0)],
                                    np.float32)
-            need_reset = policy.step(data, cmd)
-            if need_reset:
-                data.reset(model)
+            if supervisor is not None:
+                if supervisor.holding(sim_t):
+                    policy.hold(data)
+                else:
+                    policy.step(data, cmd)
+                if supervisor.check_fallen(data, sim_t):
+                    print(f"[stairs] fall detected — respawn "
+                          f"#{supervisor.n_respawns + 1} at t={sim_t:.1f}s", flush=True)
+                    supervisor.respawn(data, model, sim_t)
+                    policy.reset_action()
+                elif supervisor.check_deadlock(data, sim_t, cmd):
+                    print(f"[stairs] command-motion deadlock (prone, frozen, "
+                          f"commanded) — respawn #{supervisor.n_respawns + 1} "
+                          f"at t={sim_t:.1f}s", flush=True)
+                    supervisor.respawn(data, model, sim_t)
+                    policy.reset_action()
+            else:
+                need_reset = policy.step(data, cmd)
+                if need_reset:
+                    data.reset(model)
 
-        # ---- IMU (accumulator: the physics step does not divide 200 Hz) ----
+        # ---- IMU (accumulator: must catch up ALL missed slots per step) ----
+        # With the stairs scene timestep (0.01 s) one physics step spans TWO
+        # 200 Hz IMU slots; an `if` here published only one sample per step
+        # (measured 100 Hz out of the server) and let next_imu fall behind
+        # sim_t forever. `while` publishes every missed slot with its nominal
+        # timestamp; the sensor values are step-constant, matching how the
+        # real IMU's samples between camera frames would be interpolated.
         if sim_t >= next_imu:
             gyro = np.asarray(model.get_sensor_value("imu_gyro", data)).ravel()
             accel = np.asarray(model.get_sensor_value("imu_accel", data)).ravel()
             quat = np.asarray(model.get_sensor_value("imu_quat", data)).ravel()
-            if ring:
-                ring.publish_imu(sim_t, gyro, accel, quat)
-            n_imu += 1
-            next_imu += imu_period
+            while sim_t >= next_imu:
+                if ring:
+                    ring.publish_imu(next_imu, gyro, accel, quat)
+                n_imu += 1
+                next_imu += imu_period
 
         # ---- ground truth (base pose in the MJCF world frame) ----
         if ring and sim_t >= next_gt:

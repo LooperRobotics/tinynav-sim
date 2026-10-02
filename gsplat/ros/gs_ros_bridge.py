@@ -119,6 +119,7 @@ class Bridge(Node):
         self.create_timer(0.02, self.publish_gt)
         self.info = {k: cam_info(FRAMES[k], right=(k == "infra2")) for k in ("infra1", "infra2", "color")}
         self.cmd_file = cmd_file
+        self.vx_min = float(os.environ.get("TINYNAV_GS_VX_MIN", "-0.4"))
         if cmd_file:
             self.create_subscription(Twist, "/cmd_vel", self.on_cmd_vel, qos)
         while True:                     # the simulator may still be loading: wait for the ring
@@ -144,6 +145,12 @@ class Bridge(Node):
     def on_cmd_vel(self, msg: Twist):
         if not self.cmd_file:
             return
+        # Reverse clamp: keyboard teleop sends vx=-0.5, but the stairs policy
+        # is only trained on vx >= -0.4 — outside the envelope its behavior is
+        # undefined (user-visible flailing). Floor matches the training
+        # distribution; override via TINYNAV_GS_VX_MIN when a wider-envelope
+        # policy lands.
+        vx = max(msg.linear.x, self.vx_min)
         try:
             # atomic replace: a plain write_text is O_TRUNC-then-write, and the
             # simulator polling every 20 ms can read the truncated-but-empty
@@ -151,7 +158,7 @@ class Bridge(Node):
             # cmd_vel; bring-up's manual pokes never hit the window)
             tmp = self.cmd_file + ".tmp"
             with open(tmp, "w") as f:
-                f.write(f"{msg.linear.x:.4f} {msg.linear.y:.4f} {msg.angular.z:.4f}\n")
+                f.write(f"{vx:.4f} {msg.linear.y:.4f} {msg.angular.z:.4f}\n")
             os.replace(tmp, self.cmd_file)
         except OSError as exc:
             self.get_logger().warn(f"cmd file write failed: {exc}")
