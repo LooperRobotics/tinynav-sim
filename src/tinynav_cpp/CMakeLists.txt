@@ -28,6 +28,7 @@ find_package(Ceres REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 find_library(NVINFER_LIB nvinfer REQUIRED)
 find_library(NVONNXPARSER_LIB nvonnxparser)
+find_library(SQLITE3_LIB sqlite3 REQUIRED)
 
 # ---------------------------------------------------------------- GTSAM (optional)
 # The image ships a full gtsam 4.3a1 tree (/3rdparty/gtsam: sources + build with
@@ -65,7 +66,8 @@ file(GLOB_RECURSE CORE_SOURCES CONFIGURE_DEPENDS
   src/core/*.cpp src/kernels/*.cpp src/planning/*.cpp src/mapping/*.cpp)
 add_library(tinynav_core STATIC ${CORE_SOURCES})
 target_include_directories(tinynav_core PUBLIC include ${EIGEN3_INCLUDE_DIRS} ${OpenCV_INCLUDE_DIRS})
-target_link_libraries(tinynav_core PUBLIC ${OpenCV_LIBS} Eigen3::Eigen yaml-cpp ${CERES_LIBRARIES})
+target_link_libraries(tinynav_core PUBLIC ${OpenCV_LIBS} Eigen3::Eigen yaml-cpp ${CERES_LIBRARIES}
+  ${SQLITE3_LIB})
 
 # ---------------------------------------------------------------- TensorRT
 file(GLOB TRT_SOURCES CONFIGURE_DEPENDS src/trt/*.cpp)

@@ -599,3 +599,43 @@ C++ 的 f64 反而是保真度偏离，此改同时修正。加载日志新增�
 测试 72/72；e2e：`VLAD 92x24576 f32 (9MB)`、到点 4.48/4.5、reloc 锁定零失败。
 8G 预算（降密后 959 帧）：索引 94MB + 位姿/杂项 ~30MB + TRT 引擎与 VIO 若干百 MB
 ——eager 索引无压力；同密度 9587 帧则索引 943MB，仍以降密为先。
+
+
+## M3：map format v3 = 单文件 SQLite（docs/plan-siglip2-map-builder.md 阶段 3，已落地）
+
+- **schema**（`map.sqlite`，WAL，`PRAGMA user_version=3`，meta.format=tinynav_map_v3）：
+  - `meta(k,v)`：格式键 + `blobs_meta`（JSON：每个 blob 的 dtype/shape 或 json 标记）
+    + 每 blob 冗余键 `blob.<name>.dtype/.shape/.json`（C++ 侧零 JSON 依赖）；
+  - `keyframes(ts INTEGER PK, pose BLOB)`：16×f64 行主序 4x4；
+  - `arrays(ts,name,dtype,shape,data, PK(ts,name))`：per-keyframe 变长数组
+    （depth `<u2` mm / feature_kpts /feature_descps `<f4` / feature_mask `<u1` /
+    vlad_descriptor `<f4` / semantic_embedding `<f4`），dtype numpy 风格字符串、
+    shape JSON 文本，C++ 按 dtype 解析不猜；feature_offsets 不存（按行数重建，
+    缺失 features 的帧=0 行，对齐 v2 offsets 语义）；
+  - `images(ts,kind,codec,data)`：schema 预留，builder 不落图；
+  - `blobs(name PK, data)`：vlad_centres + aux（intrinsics/occupancy/sdf/path_*/
+    baseline/rgb_camera_intrinsics…）+ semantic_meta（JSON 文本）。
+- **python**：`tools/mapio/sqlite_writer.py`（SQLiteWriter，第二个 MapWriter 实现，
+  finalize 经 `load_map_v3()` 全量回读校验 shape/dtype/字节，对齐 V2NpyWriter 纪律）；
+  `tools/migrate_map_to_v3.py`（源自动识别 v2[pose_timestamps.npy]/v1[poses.npy+shelve，
+  读取方式对齐 export_map_v2.py]）。
+- **C++**：`mapping/map_v3.{hpp,cpp}`（tinynav_core，-lsqlite3，无 ROS 头）。
+  与 map_v2 同款消费面 + `semantic_embeddings`(N×768，空=缺失/全零) + `meta`。
+  features/depth 零拷贝视图 = sqlite BLOB 指针，按行 keep-alive prepared statement
+  （sqlite3_column_blob 指针只在下一次 step 前有效，全表扫描会悬垂早期行——
+  MapV3 所有者必须存活的注释写在 hpp）。契约：必需块缺失 → false+error 降级；
+  语义缺失/全零 → true 留空。
+- **测试**：`test/test_map_v3.cpp`（fixture 由迁移器生成，缺失 GTEST_SKIP 打印命令；
+  poses 1e-9 / vlad f32 位级 / depth u2 位级 / features 行数 / semantic 非零行数对拍
+  v2 npy）。全量 **74/74 绿**。
+- **探针**：`tools/probes/probe_map_v3.cpp`（镜像 probe_map_v2；
+  tinynav_core 需 `--whole-archive` 链接——组件内暂无 load_map_v3 引用点，
+  普通归档链接会把 map_v3.o 丢掉；接线后此限制自然消失）。
+- **验收**：python round-trip 逐数组 np.array_equal（depth u2/vlad f32 位级）；
+  v1→v3、v2→v3 双路径实测；probe_map_v3 对 fixtures 图 LOAD OK（44kf，
+  vlad 44x24576，semantic 44x768）；probe_map_v2 / export_map_v2.py 回归不变。
+- **坑**：① numpy `ascontiguousarray` 会把 0-d 提升 1-d（baseline.npy 0-d 标量，
+  finalize 回读校验拦下，`_c()` 仅对非连续数组用 ascontiguousarray）；
+  ② Eigen 列主序，pose BLOB 整块 memcpy 会转置（gtest 拦下，改逐元素行主序填充）。
+- **未做**（按计划后续单独立项）：mapping_component 接线 load_map_v3（--map /
+  reloc 消费 v3 图）、LiveCapture 切 v3 写出、builder 直写 v3。
