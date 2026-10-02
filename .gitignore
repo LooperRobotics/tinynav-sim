@@ -21,3 +21,7 @@ models/
 /tools/probes/probe_lg_race
 /tools/probes/probe_sp
 /tools/probes/probe_sp_race
+/tools/probes/probe_map_v2
+/tools/probes/probe_map_v3
+
+docs/oracle
