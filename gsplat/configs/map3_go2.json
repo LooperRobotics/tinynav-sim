@@ -1,0 +1,37 @@
+{
+  "robot": "go2",
+  "scene": "map3_scene/mjcf/scene.xml",
+  "scene_gaussians": {
+    "scene": "map3_scene/3dgs/splat.ply"
+  },
+  "assets_dir": "assets",
+  "robot_gs_dir": "assets/go2",
+  "save_dir": "data/navigation_map3",
+  "prompt": "Climb the stairwell",
+  "auto_reset": true,
+  "initial_qpos": [
+    -6.0,
+    4.0,
+    12.173,
+    0,
+    0,
+    1.0,
+    0.0,
+    0.0,
+    0.9,
+    -1.8,
+    0.0,
+    0.9,
+    -1.8,
+    0.0,
+    0.9,
+    -1.8,
+    0.0,
+    0.9,
+    -1.8
+  ],
+  "rig": "models/robots/navigation/go2/go2_sensor_rig_stairs.xml",
+  "policy": "stairs_v12",
+  "policy_surfaces_file": "map3_scene/mjcf/map3_collision.xml",
+  "policy_onnx": "policies/go2_stairs_map3.onnx"
+}

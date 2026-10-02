@@ -73,7 +73,24 @@ bash gsplat/run_gsplat.sh --stack cpp --no-rviz
 bash gsplat/kill_gsplat.sh
 ```
 
-场景：`--scene church`（教堂中殿，出生朝 +Y 沿过道）或 `--scene nav1`。
+场景：`--scene church`（教堂中殿，出生朝 +Y 沿过道）、`--scene nav1`、`--scene map2`
+（MetaCam map_2 / spirula 训练图；出生点必须落在低采段——近地面 0.45 m 只有低采段
+有干净几何，见 `map2_scene/mjcf/scene.xml` 注释）或 `--scene map3`（MetaCam map_3
+楼梯间；**带碰撞**——123 个逐构件 box geoms 来自 Blender 重建模型，5 层楼板 + 91 级
+踏步，出生在 F1 正对 L0 梯段；狗眼高度渲染仍糊——该图无低采段，楼梯策略实验可用、
+VIO 用不行）。
+
+## 场景脚手架工具（新增场景用）
+
+- `python3 gsplat/tools/make_collision_xml.py`（**在 blender 下运行**，见文件头）：
+  Blender 碰撞模型 → geoms-only MJCF 片段。**逐构件、不合并、无凸包**——每个 8 顶点
+  box 对象精确读成一个 `<geom type="box">`（church 的 1286 个 box 同构）；把所有构件
+  merge 成一个 mesh 再算凸包会把楼梯间填成实心，永远不要那样做。
+- `python3 gsplat/tools/pick_spawn.py <transforms.json> [--level z] [--target x y z]`：
+  从采集轨迹选出生点。朝向取**轨迹切线**（MetaCam 采集时环视扫描，光轴≠行进方向），
+  直线度用时间邻居算（走廊往返走两遍时空间邻居的切线正好相反）；多层场景先按相机高度
+  聚类出楼层，`--level` 钉层时同时按高度过滤；`--eye 0.45` 的低采加分对 map_2 这类
+  有低采段的图有效，map_3 没有低采段该项自动封顶在 1 m 以下。
 
 **窗口默认情况**：rviz 默认启动；**MotrixSim viewer（`--gui`）默认关闭**——它渲染
 走 Mesa llvmpipe，实测开它会挤掉相机流的预算（52→75 ms/帧）。两者都可以显式控制

@@ -64,6 +64,8 @@ GSPG_NAV = gspg_root() / "demo" / "navigation"
 SCENES = {                      # mirrors gsplat/configs/*.json
     "church": ("church_scene/mjcf/scene.xml", "church_scene"),
     "nav1": ("nav_scene_1/mjcf/scene.xml", "nav_scene_1"),
+    "map2": ("map2_scene/mjcf/scene.xml", "map2_scene"),
+    "map3": ("map3_scene/mjcf/scene.xml", "map3_scene"),
 }
 RIG_REL = "models/robots/navigation/go2/go2_sensor_rig.xml"
 

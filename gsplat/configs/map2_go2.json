@@ -1,0 +1,18 @@
+{
+  "robot": "go2",
+  "scene": "map2_scene/mjcf/scene.xml",
+  "scene_gaussians": {
+    "scene": "map2_scene/3dgs/splat.ply"
+  },
+  "assets_dir": "assets",
+  "robot_gs_dir": "assets/go2",
+  "save_dir": "data/navigation_map2",
+  "prompt": "Navigate map_2",
+  "auto_reset": true,
+  "initial_qpos": [
+    3.21, -5.54, -0.755,
+    0, 0, -0.1002, 0.995,
+    0.1, 0.9, -1.8, -0.1, 0.9, -1.8,
+    0.1, 0.9, -1.8, -0.1, 0.9, -1.8
+  ]
+}
