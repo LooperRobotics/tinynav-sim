@@ -152,7 +152,14 @@ if [[ $GUI == 1 ]]; then
   # `env -i`: the interactive window shell sources /root/.bashrc, whose
   # NVIDIA PRIME/EGL trio (fine for rviz/gz) makes the viewer's wgpu path
   # stall (~1 s per frame, measured); a minimal env is the reliable form.
-  win viewer "env -i DISPLAY=${DISPLAY:-:1} XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/tmp} HOME=$HOME PATH=/usr/bin:/bin GS_PLAYGROUND_ROOT=${GS_PLAYGROUND_ROOT:-/workspace/github/simulation/gs_playground} $GS_VENV/bin/python -u $GS_ROOT/tools/view_window.py --scene $SCENE --fps 30 2>&1 | tee logs/gsview.log"
+  VIEWER_CMD="env -i DISPLAY=${DISPLAY:-:1} XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/tmp} HOME=$HOME PATH=/usr/bin:/bin GS_PLAYGROUND_ROOT=${GS_PLAYGROUND_ROOT:-/workspace/github/simulation/gs_playground} $GS_VENV/bin/python -u $GS_ROOT/tools/view_window.py --scene $SCENE --fps 30 2>&1 | tee logs/gsview.log"
+  win viewer "$VIEWER_CMD"
+  # watchdog: the wgpu presentation path can degrade mid-run to ~1 Hz and
+  # never recovers in-process (measured); the viewer is stateless (shm state
+  # slot only), so the watchdog restarts it. see tools/view_watchdog.sh.
+  WATCH_SESSION=$SESSION WATCH_VIEWER_CMD="$VIEWER_CMD" WATCH_WS_ROOT="$WS_ROOT" \
+    nohup bash "$GS_ROOT/tools/view_watchdog.sh" >> logs/view_watchdog.log 2>&1 &
+  echo $! > /tmp/gsview_watchdog.pid
 fi
 
 # ---- stack -----------------------------------------------------------------

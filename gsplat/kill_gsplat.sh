@@ -24,6 +24,7 @@ for p in "${PATTERNS[@]}"; do pkill -TERM -f "$p" 2>/dev/null; done
 sleep 2
 for p in "${PATTERNS[@]}"; do pkill -KILL -f "$p" 2>/dev/null; done
 tmux kill-session -t tinynav_gs 2>/dev/null
+[ -f /tmp/gsview_watchdog.pid ] && kill "$(cat /tmp/gsview_watchdog.pid)" 2>/dev/null
 rm -f /dev/shm/gsplay_sensors.bin /dev/shm/gsplay_cmd.txt /dev/shm/gsplay_cmd.txt.tmp \
       /dev/shm/gsplay_state.bin
 
