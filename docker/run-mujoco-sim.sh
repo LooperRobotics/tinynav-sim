@@ -15,6 +15,13 @@ NAME="mjsim-${FORM}"
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 
 # keyboard capture needs the input group's gid from the host
+#
+# /dev/input is bind-mounted live WITH a device-cgroup rule for the whole
+# input major (13) rather than passed as `--device /dev/input`: --device
+# snapshots the nodes present at container creation, so a keyboard that
+# appears later (re-plugged, re-paired, or simply a different event number)
+# stays invisible until the container is restarted -- which reads as
+# "the keyboard stopped working" while nothing in the sim changed.
 INPUT_GID="$(getent group input | cut -d: -f3)"
 
 docker run -d --name "$NAME" \
@@ -23,7 +30,8 @@ docker run -d --name "$NAME" \
   -e DISPLAY="${DISPLAY:-:1}" \
   -v /tmp/.X11-unix:/tmp/.X11-unix \
   ${XDG_RUNTIME_DIR:+-v "$XDG_RUNTIME_DIR:$XDG_RUNTIME_DIR" -e XDG_RUNTIME_DIR} \
-  --device /dev/input \
+  -v /dev/input:/dev/input \
+  --device-cgroup-rule "c 13:* rwm" \
   ${INPUT_GID:+--group-add "$INPUT_GID"} \
   $(for d in /dev/dri/card0 /dev/dri/card1 /dev/dri/renderD128 /dev/dri/renderD129; do [ -e "$d" ] && echo -n "--device $d "; done) \
   --network host \
