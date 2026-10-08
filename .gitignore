@@ -25,3 +25,24 @@ models/
 /tools/probes/probe_map_v3
 
 docs/oracle
+.docker/
+
+# splat assets: large 3DGS PLY / vendor npz (see mujoco/README.md)
+mujoco/assets/splat/
+
+# model asset bundle (model.zip -> model/): splat scene + go2 meshes,
+# distributed out-of-band, never in git (see mujoco/README.md 资产来源)
+model/
+model.zip
+
+# runtime-generated: plant.py rewrites the preprocessed scene here on every run
+mujoco/assets/.compose/
+
+# training-side checkpoints (only the ONNX policy ships; manifest = policy.sha256)
+mujoco/assets/policy/*.pt
+
+# vendored viser web client build outputs (source IS tracked under
+# mujoco/viser_client; see that README)
+mujoco/viser_client/node_modules/
+mujoco/viser_client/dist/
+mujoco/viser_client/build/

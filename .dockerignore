@@ -11,3 +11,17 @@ __pycache__
 .cache
 tmp_probe
 .container
+docs/oracle
+tools/probes/probe_lg
+tools/probes/probe_lg_race
+tools/probes/probe_sp
+tools/probes/probe_sp_race
+tools/probes/probe_map_v2
+tools/probes/probe_map_v3
+# generated at runtime by plant.py; nothing in the images reads it
+mujoco/assets/.compose
+
+# node build outputs of the vendored viser client (source is copied, not these)
+mujoco/viser_client/node_modules
+mujoco/viser_client/dist
+mujoco/viser_client/build

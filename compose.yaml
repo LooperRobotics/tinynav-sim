@@ -35,3 +35,42 @@ services:
       - /run/user/${HOST_UID:-1000}:/run/user/${HOST_UID:-1000}:ro
     devices:
       - /dev/dri:/dev/dri
+
+  # Pure-simulation container (gzsim + gsplat only; docker/sim.Dockerfile).
+  # The tinynav stack runs in its own container and talks DDS over loopback —
+  # both sides MUST stay on host network for the baked 127.0.0.1 Cyclone
+  # peers to line up (docs/plan-sim-image-split.md §7.3).
+  sim:
+    build:
+      context: .
+      dockerfile: docker/sim.Dockerfile
+      # host network: the apt layer pulls from the default international
+      # sources (the aliyun mirror throttles the apt client to ~300 KB/s) —
+      # through the bridge network this is forwarded traffic, slow; through
+      # host network it rides the host's clash tunnel at proxy speed.
+      network: host
+    image: tinynav-sim:x86_64
+    container_name: gsim
+    init: true
+    gpus: all
+    network_mode: host
+    ipc: host
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    group_add:
+      - "${VIDEO_GID:-44}"
+      - "${RENDER_GID:-109}"
+    working_dir: /workspace/tinynav-sim
+    environment:
+      HOME: /tmp
+      DISPLAY: ${DISPLAY:-}
+      XDG_RUNTIME_DIR: /run/user/${HOST_UID:-1000}
+      NVIDIA_DRIVER_CAPABILITIES: all
+      GS_PLAYGROUND_ROOT: /workspace/gs_playground
+    volumes:
+      - .:/workspace/tinynav-sim
+      - ${GS_PLAYGROUND_ROOT:-../gs_playground}:/workspace/gs_playground:ro
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - /run/user/${HOST_UID:-1000}:/run/user/${HOST_UID:-1000}:ro
+    devices:
+      - /dev/dri:/dev/dri
+    command: sleep infinity
