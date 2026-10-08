@@ -43,9 +43,14 @@ ENV PIP_BREAK_SYSTEM_PACKAGES=1
 # the venv shadows it cleanly with the same numpy version pinned.
 # uv for the heavy install: pip serially backtracks through large opencv
 # wheels at mirror speed (~15 min here); uv resolves once and downloads in
-# parallel. uv and gausscam both come from the same aliyun index (PyPI
-# mirror; gausscam is pinned to the released wheel, hil exercises its whole
-# API surface at boot so a bad pin fails the image loudly).
+# parallel. uv and the deps both come from the same aliyun index (PyPI
+# mirror; ghcr.io is flaky on this network). gausscam is fetched from its
+# exact official wheel URL instead of the index: aliyun lags on fresh
+# releases and 0.1.5 is not synced yet. Swap this back to `gausscam==0.1.5`
+# once the mirror carries it (the installed artifact is 0.1.5,
+# sha256 240f88a20cac49e0a406f482f0aaf3ef39acce07881e0e48d7b6e36cfdb09efd).
+# The pin matters: hil exercises the whole gausscam API at boot, so a bad
+# version fails the image loudly rather than at run time.
 RUN python3 -m pip install --no-cache-dir \
       -i https://mirrors.aliyun.com/pypi/simple/ uv \
     && uv venv --system-site-packages -p /usr/bin/python3 /opt/mjsim \
@@ -53,7 +58,8 @@ RUN python3 -m pip install --no-cache-dir \
       --index-url https://mirrors.aliyun.com/pypi/simple/ \
       numpy==1.26.4 \
       mujoco==3.14.0 onnxruntime opencv-python-headless wgpu==0.32.0 \
-      viser==1.1.1 trimesh plyfile gausscam==0.1.4 \
+      viser==1.1.1 trimesh plyfile \
+      https://files.pythonhosted.org/packages/76/95/b87b576f638b58d1a0104c27d7526cddf4f5fb0ec4a18743ea6f2f16c87c/gausscam-0.1.5-py3-none-any.whl \
     && rm -rf /root/.cache/uv
 
 # viser's web client hardcodes keyboard camera controls (arrows rotate,
