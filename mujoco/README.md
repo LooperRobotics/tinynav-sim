@@ -47,7 +47,9 @@ mujoco/
 资产来源：**不入 git 的大资产统一走 `model/` 资产包**——把 `model.zip`
 解压到仓根即得（`model/splat/` = 场景，`model/go2/` = 减面网格；包内自带
 `VERSION.txt` 与 `MANIFEST.sha256`，解压后 `sha256sum -c MANIFEST.sha256`
-验包）。运行期查找链：环境变量 `ROBOT_ASSETS` → 仓内 `model/` → 旧
+验包）。重打包：`bash mujoco/scripts/pack_model.sh`（自动重生成
+MANIFEST.sha256 再 zip，默认输出到仓外 `../model.zip`）。运行期查找链：
+环境变量 `ROBOT_ASSETS` → 仓内 `model/` → 旧
 `~/workspace/dm/robot-assets` checkout；mjsim 镜像把整个包烤在镜像内
 仓根（与宿主机解压后布局一致），构建前放好 `model/` 即可。包内容出处：
 `map3_scene.ply`
@@ -175,6 +177,15 @@ ExactTime 同 stamp，10Hz 默认）、camera_info×3、vio_100hz 100Hz、vio_st
 latched、tf_static 5s 重发、imu ~200Hz BEST_EFFORT。**stamp = 采集时刻位姿的
 采样时刻**；IMU = imu site 物理传感器每个物理子步（200Hz）采样，vio/imu 完整
 包络相机 stamp（补采补丁已删）。
+
+**搭链路（对端同样要钉）**：mjsim 侧把 Cyclone 钉在 loopback 单播（镜像已
+烤 `tools/probes/cyclone_localhost_unicast.xml`）；对端不是 Cyclone+同一钉定
+就连不上或掉帧——Fast DDS 订阅端会把 544×640 图像从 10Hz 掉到 ~4Hz，不钉 URI
+则 0Hz（连发现都没有）。对端固定动作 = `source tools/probes/hil_peer_env.sh`
+（非覆盖式：已设且有效的 URI 不动，分机 launch 自设的配置照常生效）；**rig
+容器已默认接线**（`docker/shell-env.sh` + 容器 `/root/.bashrc`，后者容器
+recreate 后需重加）。实测 `tools/probes/hil_rate_check.py`（rclpy 真订阅，
+别用 `ros2 topic list`——本环境会假阴）。
 
 ## 启动
 
