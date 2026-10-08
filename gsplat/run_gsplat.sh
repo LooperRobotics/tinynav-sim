@@ -36,12 +36,18 @@ WS_ROOT="$(dirname "$GS_ROOT")"
 # Reference snapshot first on PYTHONPATH (namespace-package trick, see
 # gazebo/README.md); the image python3 already carries site-packages + gtsam.
 export PYTHONPATH="$WS_ROOT/reference:${PYTHONPATH}"
-# CycloneDDS everywhere, and clear the image's baked CYCLONEDDS_URI that points
-# at a file missing in this container (same reason as gazebo/run_simulator.sh;
-# for the bridge it is not just cosmetic: Fast DDS drops the 783 KB color image
-# to 2.5 Hz).
+# CycloneDDS everywhere. The tinynav full image bakes a CYCLONEDDS_URI whose
+# file is missing in this container — and on the bridge that is not just
+# cosmetic: Fast DDS drops the 783 KB color image to 2.5 Hz — so clear stale
+# URIs. The pure-sim image (docker/sim.Dockerfile) bakes the single-host
+# loopback-unicast config instead — keep it (VPN-TUN immune, see
+# docs/plan-sim-image-split.md §5).
 export RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}"
-export CYCLONEDDS_URI=""
+case "${CYCLONEDDS_URI:-}" in
+  *localhost_unicast*) : ;;
+  *) export CYCLONEDDS_URI="" ;;
+esac
+bash "$WS_ROOT/tools/preflight_dds.sh" || exit 1
 
 GS_VENV="${GS_VENV:-/opt/venv_gs}"
 GS_CUDA_HOME="${GS_CUDA_HOME:-/opt/cuda-shim-gs}"
@@ -113,7 +119,7 @@ win() {
   fi
   tmux set-option -w -t "$SESSION:$1" remain-on-exit on
   tmux set-option -w -t "$SESSION:$1" automatic-rename off
-  tmux send-keys -t "$SESSION:$1" "export PYTHONPATH=\"$PYTHONPATH\" TINYNAV_DB_PATH=\"$TINYNAV_DB_PATH\" RMW_IMPLEMENTATION=\"$RMW_IMPLEMENTATION\" CYCLONEDDS_URI=\"\"" Enter
+  tmux send-keys -t "$SESSION:$1" "export PYTHONPATH=\"$PYTHONPATH\" TINYNAV_DB_PATH=\"$TINYNAV_DB_PATH\" RMW_IMPLEMENTATION=\"$RMW_IMPLEMENTATION\" CYCLONEDDS_URI=\"$CYCLONEDDS_URI\"" Enter
   tmux send-keys -t "$SESSION:$1" "$2" Enter
 }
 

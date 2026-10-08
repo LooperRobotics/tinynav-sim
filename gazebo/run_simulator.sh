@@ -82,12 +82,19 @@ if [[ -z ${RMW_IMPLEMENTATION:-} ]]; then
     echo "INFO: rmw_cyclonedds_cpp is unavailable; using rmw_fastrtps_cpp for local simulation"
   fi
 fi
-# The image ENV bakes CYCLONEDDS_URI to /tinynav/scripts/cyclone_dds_localhost.xml,
-# which no longer exists in the rig container — every rmw_cyclonedds node then
-# dies at domain creation ("can't open configuration file"). Clear it for plain
-# local runs (Cyclone defaults suffice on one machine); the split-site launches
-# set their own CYCLONEDDS_URI later and override this.
-export CYCLONEDDS_URI=""
+# The tinynav full image bakes CYCLONEDDS_URI to /tinynav/scripts/cyclone_dds_localhost.xml,
+# which does not exist in the rig container — every rmw_cyclonedds node then
+# dies at domain creation ("can't open configuration file"). Clear such stale
+# URIs for plain local runs (Cyclone defaults suffice on one machine); the
+# split-site launches set their own CYCLONEDDS_URI later and override this.
+# The pure-sim image (docker/sim.Dockerfile) bakes the single-host
+# loopback-unicast config instead — keep it (VPN-TUN immune, see
+# docs/plan-sim-image-split.md §5).
+case "${CYCLONEDDS_URI:-}" in
+  *localhost_unicast*) : ;;
+  *) export CYCLONEDDS_URI="" ;;
+esac
+bash "$WS_ROOT/tools/preflight_dds.sh" || exit 1
 WITH_MAP=0
 # defaults: the go2 rig on the featureless empty world; yard (textured anchor
 # walls) is the drive-test pick via --world.
@@ -244,7 +251,7 @@ win() {
   tmux set-option -w -t "$SESSION:$1" automatic-rename off
   # The image's bashrc resets the environment: re-export what the windows need
   # explicitly, BEFORE the window command runs.
-  tmux send-keys -t "$SESSION:$1" "source \"$WS_ROOT/docker/shell-env.sh\"; export PYTHONPATH=\"$PYTHONPATH\" IGN_GAZEBO_RESOURCE_PATH=\"$IGN_GAZEBO_RESOURCE_PATH\" TINYNAV_DB_PATH=\"$TINYNAV_DB_PATH\" RMW_IMPLEMENTATION=\"$RMW_IMPLEMENTATION\" CYCLONEDDS_URI=\"\" DISPLAY=\"${DISPLAY:-}\" XAUTHORITY=\"${XAUTHORITY:-}\"" Enter
+  tmux send-keys -t "$SESSION:$1" "source \"$WS_ROOT/docker/shell-env.sh\"; export PYTHONPATH=\"$PYTHONPATH\" IGN_GAZEBO_RESOURCE_PATH=\"$IGN_GAZEBO_RESOURCE_PATH\" TINYNAV_DB_PATH=\"$TINYNAV_DB_PATH\" RMW_IMPLEMENTATION=\"$RMW_IMPLEMENTATION\" CYCLONEDDS_URI=\"$CYCLONEDDS_URI\" DISPLAY=\"${DISPLAY:-}\" XAUTHORITY=\"${XAUTHORITY:-}\"" Enter
   tmux send-keys -t "$SESSION:$1" "$2" Enter
 }
 
@@ -284,7 +291,7 @@ if [[ $STACK == cpp ]]; then
   win cpp "source $TINYNAV_INSTALL_PREFIX/setup.bash && ros2 launch tinynav_cpp tinynav.launch.py $CPP_LAUNCH_ARGS 2>&1 | tee logs/cpp.log"
   # same visualization face as the full stack: the cpp nodes publish the
   # identical topic names, so the stock vis.rviz renders them unchanged
-  win rviz "rviz2 -d /tinynav/docs/vis.rviz 2>&1 | tee logs/rviz.log"
+  win rviz "rviz2 -d "$WS_ROOT"/docs/vis.rviz 2>&1 | tee logs/rviz.log"
 fi
 if [[ $STACK == full ]]; then
 PLAN_ARGS=""
@@ -309,7 +316,7 @@ if [[ $HAVE_PYNPUT == 1 ]]; then
 else
   echo "WARN: pynput not installed -- teleop window skipped (pip install pynput to enable)"
 fi
-  win rviz "rviz2 -d /tinynav/docs/vis.rviz 2>&1 | tee logs/rviz.log"
+  win rviz "rviz2 -d "$WS_ROOT"/docs/vis.rviz 2>&1 | tee logs/rviz.log"
   if [[ $WITH_MAP == 1 ]]; then
     win map "python3 $WS_ROOT/reference/tinynav/core/map_node.py --tinynav_map_path $MAP_DIR --tinynav_db_path $NAV_DB_DIR 2>&1 | tee logs/map.log"
   fi

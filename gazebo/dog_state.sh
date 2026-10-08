@@ -113,13 +113,18 @@ PY
 fi
 
 # --- trajectory verdict (optional) -------------------------------------------
+# numpy carrier: the stack venv on the full rig, apt python3-numpy in the
+# pure-sim image (which has no /opt/venv).
+NUMPY_PY=/opt/venv/bin/python3
+[[ -x $NUMPY_PY ]] || NUMPY_PY=$(command -v python3)
+
 # Map v2: pose_matrices.npy (n,4,4); a python-format poses.npy dict is not
 # readable here on purpose — export v2 first (tools/export_map_v2.py).
 if [[ -n "$MAP_DIR" ]]; then
   PM="$MAP_DIR/pose_matrices.npy"
   [[ -f "$PM" ]] || PM="$MAP_DIR/poses.npy"
   if [[ -f "$PM" ]]; then
-    read -r X0 X1 Y0 Y1 VERDICT DETAIL <<<"$(/opt/venv/bin/python3 - "$PM" "$GX" "$GY" "$MARGIN" <<'PY'
+    read -r X0 X1 Y0 Y1 VERDICT DETAIL <<<"$("$NUMPY_PY" - "$PM" "$GX" "$GY" "$MARGIN" <<'PY'
 import sys
 import numpy as np
 pm, gx, gy, margin = sys.argv[1], float(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])

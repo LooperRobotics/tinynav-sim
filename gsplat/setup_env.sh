@@ -80,7 +80,8 @@ else
     uv pip install --python /opt/venv_gs/bin/python torch==2.7.0+cu128 \
       --index-url https://download.pytorch.org/whl/cu128
     uv pip install --python /opt/venv_gs/bin/python motrixsim-core==0.7.1.dev97295 \
-      --index-url https://pypi.motphys.com/simple/ --extra-index-url https://mirrors.aliyun.com/pypi/web/simple
+      --index-url https://pypi.motphys.com/simple/ --extra-index-url https://mirrors.aliyun.com/pypi/web/simple \
+      --index-strategy unsafe-best-match
     uv pip install --python /opt/venv_gs/bin/python \
       gsplat==1.5.3 gaussian_renderer==0.2.0 numpy==2.2.6 scipy==1.15.3 \
       plyfile==1.1.3 onnxruntime==1.22.1 ninja pillow packaging \

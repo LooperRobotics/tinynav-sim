@@ -24,7 +24,7 @@ def generate_launch_description():
             # logger names for the per-node log files, and `ros2 param` can
             # address them individually again. tinynav.yaml matches via its
             # /** wildcard; intra-process comms match on topic+QoS, never on
-            # node name (rclcpp IntraProcessManager, verified 2026-09-19).
+            # node name (rclcpp IntraProcessManager behavior).
             output='screen',
             parameters=[LaunchConfiguration('params_file'),
                         {'map_path': LaunchConfiguration('map_path')}],

@@ -53,7 +53,11 @@ def dds_env_args(context) -> list:
     distros' DDS type identifiers unmatchable — same-vendor CycloneDDS on
     both ends keeps them identical, and the USB point-to-point link runs on
     explicit peers with no server process. dds:=fastdds keeps the legacy
-    UDPv4 + discovery-server wiring for single-distro rigs."""
+    UDPv4 + discovery-server wiring for single-distro rigs. dds:=local is
+    the single-host container pair: loopback-unicast Cyclone, immune to
+    VPN-TUN route hijacking, no peers to pin — CYCLONEDDS_URI is inherited
+    (baked in the pure-sim image, or tools/probes/cyclone_localhost_unicast.xml
+    mounted elsewhere)."""
     if LaunchConfiguration("dds").perform(context) == "fastdds":
         return [
             SetEnvironmentVariable("FASTDDS_BUILTIN_TRANSPORTS", "UDPv4"),
@@ -67,6 +71,8 @@ def dds_env_args(context) -> list:
                      "discovery", "-i", "0"],
                 name="discovery_server", output="screen"),
         ]
+    if LaunchConfiguration("dds").perform(context) == "local":
+        return [SetEnvironmentVariable("RMW_IMPLEMENTATION", "rmw_cyclonedds_cpp")]
     return [
         SetEnvironmentVariable("RMW_IMPLEMENTATION", "rmw_cyclonedds_cpp"),
         SetEnvironmentVariable(

@@ -37,12 +37,17 @@ while [[ $# -gt 0 ]]; do
 done
 
 # --- ground truth from the ring ----------------------------------------------
+# numpy carrier: the stack venv on the full rig, apt python3-numpy in the
+# pure-sim image (which has no /opt/venv).
+NUMPY_PY=/opt/venv/bin/python3
+[[ -x $NUMPY_PY ]] || NUMPY_PY=$(command -v python3)
+
 if [[ ! -f "$RING" ]]; then
   echo "ERROR: sensor ring $RING missing — gsplat server not running?" >&2
   echo "start it: bash gsplat/run_gsplat.sh ... (inside the rig container)" >&2
   exit 1
 fi
-read -r GX GY GZ GYAW GOX GOY OZ OW GAGE <<<"$(/opt/venv/bin/python3 - "$RING" <<'PY'
+read -r GX GY GZ GYAW GOX GOY OZ OW GAGE <<<"$("$NUMPY_PY" - "$RING" <<'PY'
 import math, struct, sys
 import numpy as np
 buf = np.memmap(sys.argv[1], dtype=np.uint8, mode="r")
@@ -120,7 +125,7 @@ fi
 #    heading, ~94 deg for a configured 90 — a few degrees of residual x ~0.7 m
 #    at 10 m); useful when the stack is down.
 bbox_verdict() {  # $1 pm-file $2 x $3 y $4 margin $5 rot-deg -> sets X0..DETAIL
-  read -r X0 X1 Y0 Y1 VERDICT DETAIL <<<"$(/opt/venv/bin/python3 - "$1" "$2" "$3" "$4" "$5" <<'PY'
+  read -r X0 X1 Y0 Y1 VERDICT DETAIL <<<"$("$NUMPY_PY" - "$1" "$2" "$3" "$4" "$5" <<'PY'
 import math, sys
 import numpy as np
 pm, gx, gy, margin, yaw_deg = sys.argv[1], float(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4]), float(sys.argv[5])

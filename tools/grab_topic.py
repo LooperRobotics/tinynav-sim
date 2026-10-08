@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """One-shot ROS topic grabber — saves raw messages to disk for offline replay.
 
-Born from the 2026-09-19 reloc session: `ros2 topic echo --field data --raw`
+Born from a reloc-debugging session: `ros2 topic echo --field data --raw`
 returned 0 bytes for keyframe images and the ad-hoc /tmp subscriber script was
 thrown away, so the next session had to rewrite it. This is the keeper.
 
@@ -76,7 +76,7 @@ def main() -> int:
     node = Node("grab_topic")
     # DDS discovery needs a few seconds to converge in a fresh exec shell; a
     # single get_topic_names_and_types() snapshot here saw only the bridge
-    # topics and reported live slam topics as "not in the graph" (2026-09-19).
+    # topics and reported live slam topics as "not in the graph".
     type_name = None
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:

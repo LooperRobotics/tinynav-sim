@@ -3,7 +3,7 @@
 
 ros2 CLI graph/data tools (node list, topic hz) are BLIND under Fast DDS
 Discovery Server client mode in Humble — they report "not published" while
-real nodes exchange messages fine (verified 2026-09-20 with demo talker/
+real nodes exchange messages fine (verified with demo talker/
 listener). Verification of the split-site link therefore goes through real
 rclpy subscriptions; this is the one-liner for that.
 

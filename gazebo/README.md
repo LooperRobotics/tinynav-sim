@@ -167,6 +167,12 @@ treadmill trot（skating 步态，落足高度取体相对值、无地形感知�
 
 ## 其他
 
+- **开工纪律**：每次新操作前先确认狗位姿——`bash gazebo/dog_state.sh --slam
+  --map-dir <图>`（gz 真值 + yaw + SLAM odom + 轨迹 IN/OUT 判定）；轨迹外的
+  reloc 连败是预期行为，先重启再排查。gsplat 侧同款是 `gsplat/gs_state.sh`。
+- **带图导航**：`--stack cpp --map --map-dir output/map_v2 --world
+  gazebo/worlds/yard.sdf`；发目标 / bag 回放 / 建图与 reloc 排查见
+  `src/tinynav_cpp/README.md` 速查与 `docs/sim-mapping-runbook.md`。
 - 日志在 `$WS_ROOT/logs/`；`--map` 的地图/数据库在 `$WS_ROOT/output/`（gitignored）。
 - rviz 配置仍用镜像里的 `/tinynav/docs/vis.rviz`。
 - factory 世界的 `model://factory_01` 厂房模型在仓库外，用 `FACTORY_MODEL_ROOT`
