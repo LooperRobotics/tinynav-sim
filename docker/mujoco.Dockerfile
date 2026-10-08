@@ -102,6 +102,10 @@ PYEOF
 ENV PATH=/opt/mjsim/bin:$PATH
 
 COPY mujoco /workspace/tinynav-sim/mujoco
+# DDS: bake the single-host loopback-unicast Cyclone config (same file as
+# sim.Dockerfile; proven against VPN-TUN route hijacking -- without it
+# large image samples degrade to ~4 Hz for peers on the host network).
+COPY tools/probes/cyclone_localhost_unicast.xml /opt/dds/cyclone_localhost_unicast.xml
 # model/ asset bundle (model.zip, not in git): splat scene + go2 meshes,
 # baked AT THE REPO ROOT -- the same layout a host checkout has after
 # unzipping model.zip, so the repo-root model/ lookups in plant/hil/view
@@ -122,11 +126,18 @@ WORKDIR /workspace/tinynav-sim
 ENV MUJOCO_GL=egl \
       __GL_SYNC_TO_VBLANK=0 \
       RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
+      CYCLONEDDS_URI=file:///opt/dds/cyclone_localhost_unicast.xml \
       OPENBLAS_NUM_THREADS=1 \
       OMP_NUM_THREADS=1 \
       PYTHONPATH=/workspace/tinynav-sim/mujoco
 # RMW pinned: jazzy defaults to Fast DDS whose discovery/logging threads
 # burn extra cores beside the tinynav stack's CycloneDDS.
+# CYCLONEDDS_URI pins DDS to loopback unicast (same file the sim.Dockerfile
+# bakes): with defaults, large best-effort samples (the ~348 KB stereo
+# frames) fragment across every interface including any VPN TUN and die
+# mid-path -- subscribers saw 3.9 Hz of a clean 10 Hz while small topics
+# stayed perfect. See tools/probes/cyclone_localhost_unicast.xml and
+# docs/plan-sim-image-split.md.
 # OPENBLAS/OMP pinned: numpy's bundled OpenBLAS spins its whole pool on
 # every per-tick BLAS call (the PIE tick does tiny ones at 200 Hz) —
 # unpinned the idle-ish sim burns 5+ cores on pool spin-wait (2026-10-04:
