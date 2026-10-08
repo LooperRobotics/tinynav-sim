@@ -285,6 +285,11 @@ go2 在 map3 五层楼梯间（3DGS 视觉 + 123 逐构件碰撞盒）中：遥�
 
 ## 产物清单
 
+- **PIE 视觉策略迁移线**：wukong 机器训练的深度相机楼梯策略
+  （policy_12998.onnx）将作为第二条策略线接入 gs-playground（转弯/上下楼
+  能力覆盖 v12 短板，无接触通道失配问题）。迁移差距与训练侧待办
+  （后退/原地转/摔倒恢复/深度相机对齐）见
+  `~/workspace/github/RL/stairs/go2_pie_20261002/docs/go2-pie-gsplat-migration.md`。
 - 训练（stairs_exp / MotrixLab）：
   `motrix_envs/src/motrix_envs/locomotion/quadruped/go2_map3.py`、
   `.../go1/xmls/scene_go2_map3.xml`、`configs/task/go2-map3-stairs/`、
@@ -301,3 +306,51 @@ go2 在 map3 五层楼梯间（3DGS 视觉 + 123 逐构件碰撞盒）中：遥�
   `map3_scene/mjcf/scene.xml`（光源/护栏/dt 钉死）、
   `models/robots/navigation/go2/go2_sensor_rig_stairs.xml`、
   `policies/go2_stairs_map3.onnx`（**当前为被否的 s2 版，待回滚基线**）
+
+## PIE 策略线部署更新（后退/原地转战役收官）
+
+九轮训练战报与三个判决性发现见 wukong 机器
+`~/workspace/github/RL/docs/go2-backward-inplace-campaign.md`（本地归档
+`~/workspace/github/RL/stairs/go2_pie_20261002/` 同步）。部署侧变更：
+
+- `mujoco/assets/policy/policy.onnx` 换为 **model_18997**（楼梯 lv5 上13/下14、
+  原地转 16/16 @0.3rad/s 精确跟踪、前进 16/16；sha256 ff63892e）。
+- `policy_12998_backup.onnx` 旧部署版备份（sha f4dab830）——已移出仓内，
+  需要时从 RL 训练仓 model_12998 重导。
+- `mujoco/sim/keyboard.py`：`WZ_HOLD` 0.5→0.3（狗头 10cm/s 上限 ⇒ wz≤0.33）；
+  后退键 −0.5→−0.2（新常量 `VX_HOLD_BWD`，对齐平地后退训练带）。
+- **双专家切换器已落地**（`mujoco/sim/expert.py`）：`view.py` 默认双专家
+  `--expert auto`——后退命令（vx<−0.05 迟滞 + 50 tick 驻留）自动切平地专家，
+  其余走楼梯主力。切换时目标专家
+  GRU 清零（episode-fresh 即训练分布自身的复位语义，跨网拷贝隐状态无意义），
+  观测历史共享不盲窗。`--expert single --policy <file>` 退回单策略。
+  切换器验证：分段指令自动往返 flat↔stairs、驻留无抖动、全程直立零摔。
+- **注意**：默认形态下 18997 承担前进/楼梯，↓ 键自动触发平地专家——后退
+  直接可用，无需手动切换。
+- 旧 gsplat 线 v12/map3 产物清单（上文）未动，独立并存。
+
+### 统一策略战役：不可达，平地专家升级换血
+
+单模型"楼梯+真后退"课程（U1 纯平地后退原型 → U2 楼梯回归保鲜）在 wukong
+机器跑完并判决**不可达**：U1 的 model_24000 后退原型成型且质量超专才
+（−0.2 16/16@94%、四带速度分级），但 6000 纯平地迭代把楼梯技能清零
+（上下楼 0/16）；U2 楼梯 1000 迭代闪电恢复到上13/下15（18997 深度先验残迹
+红利）后继续退化，同一窗口内后退原型被清零、原地转也被冲刷——两个技能块在
+~1000 迭代尺度互相擦除，"保鲜剂量"无效。战报与三教训见
+`~/workspace/github/RL/docs/go2-unified-backward-campaign.md`（本地归档
+`~/workspace/github/RL/stairs/go2_pie_20261002/docs/` 同步）。
+
+部署侧净收益（战报岔路 A）：
+
+- **平地全向专家升级**：`policy_10496_flat_omni.onnx`（后退 11/16@72%，已删，
+  sha cc77739f）→ **`policy_24000_flat_omni.onnx`**（=U1 model_24000，
+  sha256 fc6b1a79）。训练探针：后退 −0.2 16/16@94%、四带分级
+  −0.05→1.07 / −0.1→1.82 / −0.15→2.86 / −0.2→3.76 m、前进 16/16、原地转
+  16/16。
+- 本仓容器 smoke 复现（`smoke.py flat --vx −0.2 --onnx …`，`--onnx` 为
+  本次新增的策略覆盖参数）：−0.2×10s 位移 −1.89m（跟踪 94.5%、upright 1.0、
+  未摔）；0.5×5s +2.32m（93%）。onnx 图契约与现役 policy.onnx 逐输入输出
+  一致（proprio 45 / proprio_history 450 / depth_history 2×60×86 /
+  memory 128 → actions 12），元数据契约（joint/order/action_scale）同源。
+- **默认策略不变**：`policy.onnx`（model_18997）仍是部署默认——统一候选点
+  楼梯 0/16 或续训不稳，均不可替换默认。
