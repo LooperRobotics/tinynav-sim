@@ -426,22 +426,27 @@ class ViserMujocoScene:
     )
 
     with self.server.gui.add_folder("Camera"):
-      cb_camera_tracking = self.server.gui.add_checkbox(
-        "Track camera",
-        initial_value=self.camera_tracking_enabled,
-        hint="Keep tracked body centered.",
-      )
+      # LOCAL PATCH: no "Track camera" checkbox when tracking is off at build
+      # time. Its tracking shifts the scene so the first free body sits at the
+      # origin and aims the camera there, which fought the hosts' own framing
+      # (view.py's Track robot chases the robot in world coordinates).
+      if self.camera_tracking_enabled:
+        cb_camera_tracking = self.server.gui.add_checkbox(
+          "Track camera",
+          initial_value=self.camera_tracking_enabled,
+          hint="Keep tracked body centered.",
+        )
 
-      @cb_camera_tracking.on_update
-      def _(_) -> None:
-        def _mutate() -> None:
-          self.camera_tracking_enabled = cb_camera_tracking.value
-          if self.camera_tracking_enabled:
-            for client in self.server.get_clients().values():
-              client.camera.position = _camera_offset
-              client.camera.look_at = np.zeros(3)
+        @cb_camera_tracking.on_update
+        def _(_) -> None:
+          def _mutate() -> None:
+            self.camera_tracking_enabled = cb_camera_tracking.value
+            if self.camera_tracking_enabled:
+              for client in self.server.get_clients().values():
+                client.camera.position = _camera_offset
+                client.camera.look_at = np.zeros(3)
 
-        self._apply_visualization_change(_mutate)
+          self._apply_visualization_change(_mutate)
 
       slider_fov = self.server.gui.add_slider(
         "FOV (\u00b0)",

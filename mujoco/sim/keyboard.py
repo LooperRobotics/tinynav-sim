@@ -30,10 +30,15 @@ A callback arrow press has no keyup event, so it counts as "held" for
 CALLBACK_HOLD_S (its analog of one hold), then exits through the same
 release-flush-to-idle path.
 
-    Up      vx = +VX_HOLD (0.5)     Down    vx = -VX_HOLD_BWD (0.2)
-    Left    wz = +WZ_HOLD (0.3)     Right   wz = -WZ_HOLD
-    ,       vy = +VY_HOLD (0.3)     .       vy = -VY_HOLD   (strafe left/right)
+    Up      vx forward              Down    vx back
+    Left    wz left                 Right   wz right
+    ,       vy left                 .       vy right   (strafe)
     Space   stop    R reset (viewer window / web GUI button)
+
+Hosts with a policy (view, hil) call set_envelope() with its training
+command range: a held key then drives `speed` (default SPEED, the web
+panel's Keyboard speed) times that range's end in its direction. Without
+an envelope the fixed VX_HOLD / VX_HOLD_BWD / WZ_HOLD / VY_HOLD apply.
 
 ConstantCmd: scripted (vx, wz) for headless smokes, optionally segmented.
 """
@@ -50,6 +55,7 @@ VX_HOLD_BWD = 0.2  # teleop backward cap; training band (-0.25, -0.05),
 WZ_HOLD = 0.3    # teleop ANGULAR_VEL; user cap ~0.10 m/s at the nose
                  # (r~0.3 m) => wz <= 0.33; in-place band (0.10, 0.33)
 VY_HOLD = 0.3    # strafe; go2_depth_v2 trains |vy| <= 0.5
+SPEED = 0.5      # held keys = this share of the policy's command range
 CALLBACK_HOLD_S = 0.8   # callback press = hold this long (no reliable repeat)
 RELEASE_FLUSH_S = 1.0   # post-release zero-flush window (gazebo RELEASE_FLUSH_S)
 
@@ -132,6 +138,10 @@ class InputPoll:
 class HoldCmd:
     def __init__(self, use_global: bool = True) -> None:
         self._lock = threading.Lock()
+        self.speed = SPEED
+        self._envelope: tuple[np.ndarray, np.ndarray] | None = None
+        # (vx forward, vx back, vy, wz) a held key commands
+        self._hold = (VX_HOLD, VX_HOLD_BWD, VY_HOLD, WZ_HOLD)
         self._reset_pending = False
         self._cb_held: dict[int, float] = {}   # code -> last event time
         self._flush_until = 0.0    # gazebo RELEASE_FLUSH_S window after release
@@ -211,14 +221,39 @@ class HoldCmd:
         held |= set(live)
         return held
 
+    def set_envelope(self, low, high) -> None:
+        """The active policy's training command range (vx, vy, wz)."""
+        with self._lock:
+            self._envelope = (np.asarray(low, dtype=np.float32),
+                              np.asarray(high, dtype=np.float32))
+            self._update_hold()
+
+    def set_speed(self, fraction: float) -> None:
+        """Held keys drive this share of the command range (0.05..1)."""
+        with self._lock:
+            self.speed = float(np.clip(fraction, 0.05, 1.0))
+            self._update_hold()
+
+    def _update_hold(self) -> None:
+        if self._envelope is None:
+            return
+        low, high = self._envelope
+        s = self.speed
+        self._hold = (s * float(high[0]), s * float(-low[0]),
+                      s * float(min(high[1], -low[1])),
+                      s * float(min(high[2], -low[2])))
+
+    def hold_speeds(self) -> tuple[float, float, float, float]:
+        """(vx forward, vx back, vy, wz) a held key commands."""
+        with self._lock:
+            return self._hold
+
     def vector(self) -> np.ndarray:
         held = self._held_set()
-        vx = (VX_HOLD if 265 in held else 0.0) - \
-             (VX_HOLD_BWD if 264 in held else 0.0)
-        vy = (VY_HOLD if 44 in held else 0.0) - \
-             (VY_HOLD if 46 in held else 0.0)
-        wz = (WZ_HOLD if 263 in held else 0.0) - \
-             (WZ_HOLD if 262 in held else 0.0)
+        fwd, back, vy_hold, wz_hold = self.hold_speeds()
+        vx = (fwd if 265 in held else 0.0) - (back if 264 in held else 0.0)
+        vy = (vy_hold if 44 in held else 0.0) - (vy_hold if 46 in held else 0.0)
+        wz = (wz_hold if 263 in held else 0.0) - (wz_hold if 262 in held else 0.0)
         return np.asarray((vx, vy, wz), dtype=np.float32)
 
     def active(self) -> str:

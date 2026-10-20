@@ -14,6 +14,9 @@ drives ViserMujocoScene directly). Local changes on top of upstream:
   scene.py
     * grid shadow_opacity 0.2 -> 0 and every receive_shadow=0.2 -> False
       (no shadows anywhere; they are rendered client-side anyway).
+    * no "Track camera" checkbox when camera_tracking_enabled is False at
+      create_visualization_gui() time: every host turns it off and frames the
+      camera itself, and checking it shifted the scene under that framing.
     * _add_fixed_geometry: translucent geoms are emitted as SEPARATE
       per-panel meshes (a merged mesh self-overlaps under doubleSided BLEND
       and reads near-opaque -- three.js can only sort per OBJECT), while
