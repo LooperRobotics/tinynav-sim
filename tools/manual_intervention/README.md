@@ -48,6 +48,7 @@ TinyNav command publisher, sends one command without heartbeat, and checks
 that the backend times out and Gazebo stops. It exits manual mode on cleanup.
 
 For task retention, enable Nav, wait for Localized, send POIs, then Take control.
-Verify the current POI and progress freeze while driving manually. Exit manual
-must leave the task paused. Resume must continue the same queue from the
-current position. Cancel explicitly ends the task.
+Verify perception and planning keep updating, and manual arrival advances the
+POI queue or completes the task. Exit manual must immediately hand an unfinished
+task back to automatic control, without Resume. A task completed manually must
+stay completed. Cancel explicitly ends the task.
