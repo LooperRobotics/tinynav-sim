@@ -35,16 +35,21 @@ clock stamps; camera/pose association uses the original simulation clock.
 Start the TinyNav backend with:
 
 ```bash
-export TINYNAV_SENSOR_MODE=looper TINYNAV_DISABLE_CHASSIS=1 ROBOT_TYPE=lekiwi
 export TINYNAV_DB_PATH=/tinynav/tinynav_db/sim-home
-python3 -m uvicorn app.backend.main:app --host 0.0.0.0 --port 8000 --timeout-graceful-shutdown 3
+python3 run_tinynav.py
 ```
+
+`run_tinynav.py` keeps Gazebo-specific setup outside TinyNav: it selects the
+Looper input, disables physical chassis startup, and supplies LeKiwi geometry
+to the backend child processes. The installed TinyNav code is unchanged.
+Run it inside the development container with `/tinynav` mounted and the ROS
+environment loaded.
 
 ## Verification
 
 With the isolated simulator idle, run `python3 verify.py` inside the ROS
-container using its DDS environment. It enters manual mode, confirms one
-TinyNav command publisher, sends one command without heartbeat, and checks
+container using its DDS environment. It enters manual mode, confirms manual
+commands are not overwritten by automatic output, sends a command without a heartbeat, and checks
 that the backend times out and Gazebo stops. It exits manual mode on cleanup.
 
 For task retention, enable Nav, wait for Localized, send POIs, then Take control.

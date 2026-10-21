@@ -40,19 +40,23 @@ async def verify():
     try:
         request('/nav/manual/enter', True)
         await asyncio.sleep(1)
-        assert [p.node_name for p in node.get_publishers_info_by_topic('/cmd_vel')] == ['ros2_node_manager']
+        publishers = sorted(p.node_name for p in node.get_publishers_info_by_topic('/cmd_vel'))
+        assert 'ros2_node_manager' in publishers
+        assert set(publishers) <= {'ros2_node_manager', 'cmd_vel_control_node'}, publishers
         async with websockets.connect('ws://127.0.0.1:8000/ws/teleop') as ws:
             sent = time.monotonic()
             await ws.send(json.dumps({'linear_x': .2, 'linear_y': 0, 'angular_z': 0}))
             await asyncio.sleep(1.2)
             assert any(t >= sent and x > .1 for t,x,y,z in commands), 'No manual command received'
+            held = [(x,y,z) for t,x,y,z in commands if sent + .05 < t < sent + .25]
+            assert held and all(v == (.2,0,0) for v in held), 'Automatic output competed with manual control'
             late = [(x,y,z) for t,x,y,z in commands if t > sent + .45]
             assert late and all(v == (0,0,0) for v in late), 'Deadman did not stop command stream'
             settled = [(x,y) for t,x,y in positions if t > sent + .65]
             assert len(settled) > 5, 'No Gazebo poses received'
             drift = math.dist(settled[0], settled[-1])
             assert drift < .01, f'Simulator kept moving after timeout: {drift}'
-        print(json.dumps({'manual_publishers': 1, 'deadman_timeout_s': .3, 'settled_drift_m': drift, 'result': 'PASS'}))
+        print(json.dumps({'command_publishers': publishers, 'deadman_timeout_s': .3, 'settled_drift_m': drift, 'result': 'PASS'}))
     finally:
         request('/nav/manual/exit', True)
         running = False
