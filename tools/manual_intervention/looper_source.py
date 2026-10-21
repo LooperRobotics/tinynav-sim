@@ -1,7 +1,7 @@
 """Gazebo ground truth adapter for Looper bridge integration tests (not a VIO estimator)."""
 import copy
 import argparse
-from tf2_ros import Buffer, TransformListener, TransformException
+from tf2_ros import Buffer, TransformListener, TransformException, StaticTransformBroadcaster
 import cv2
 from cv_bridge import CvBridge
 from collections import deque
@@ -10,7 +10,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from scipy.spatial.transform import Rotation
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, TransformStamped
 from sensor_msgs.msg import Image, CameraInfo, CompressedImage
 from tf2_msgs.msg import TFMessage
 from rosgraph_msgs.msg import Clock
@@ -25,12 +25,15 @@ class SimLooper(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.extrinsic = None
+        self.static_tf = StaticTransformBroadcaster(self)
+        self.color_transform_ready = False
         self.prefix = prefix.rstrip('/')
         self.bridge = CvBridge()
         self.camera_info = None
         self.create_subscription(CameraInfo, '/sim/camera_info', self.on_camera_info, qos_profile_sensor_data)
         self.color_pub = self.create_publisher(CompressedImage, self.prefix + '/color/image_rect_raw/compressed', 5)
-        self.color_sub = self.create_subscription(Image, '/camera/camera/color/image_raw', self.on_color, qos_profile_sensor_data)
+        self.color_raw_pub = self.create_publisher(Image, self.prefix + '/color/image_raw', 10)
+        self.color_info_pub = self.create_publisher(CameraInfo, self.prefix + '/color/camera_info', 10)
         self.poses = deque(maxlen=1000)
         self.clock = None
         self.clock_sub = self.create_subscription(Clock, '/clock', self.on_clock, qos_profile_sensor_data)
@@ -42,7 +45,8 @@ class SimLooper(Node):
         self.info_pub = self.create_publisher(CameraInfo, self.prefix + '/infra1/camera_info', 10)
         self.left = message_filters.Subscriber(self, Image, '/sim/infra1', qos_profile=qos_profile_sensor_data)
         self.depth = message_filters.Subscriber(self, Image, '/sim/depth', qos_profile=qos_profile_sensor_data)
-        self.sync = message_filters.TimeSynchronizer([self.left,self.depth], 30)
+        self.color = message_filters.Subscriber(self, Image, '/sim/color', qos_profile=qos_profile_sensor_data)
+        self.sync = message_filters.TimeSynchronizer([self.left, self.depth, self.color], 30)
         self.sync.registerCallback(self.on_images)
         self.create_timer(.01, self.on_timer)
         self.last_stamp = None
@@ -95,6 +99,22 @@ class SimLooper(Node):
                 self.extrinsic = self.tf_buffer.lookup_transform('base_link', self.camera_frame, rclpy.time.Time())
             except TransformException:
                 return
+        if not self.color_transform_ready:
+            try:
+                transform = self.tf_buffer.lookup_transform(self.camera_frame, 'camera_color_link', rclpy.time.Time())
+            except TransformException:
+                return
+            optical = Rotation.from_matrix([[0,0,1],[-1,0,0],[0,-1,0]])
+            t, q = transform.transform.translation, transform.transform.rotation
+            alias = TransformStamped()
+            alias.header.stamp = self.get_clock().now().to_msg()
+            alias.header.frame_id = 'cam_left'
+            alias.child_frame_id = 'cam_rgb'
+            alias.transform.translation.x, alias.transform.translation.y, alias.transform.translation.z = map(float, optical.inv().apply([t.x,t.y,t.z]))
+            rotation = optical.inv() * Rotation.from_quat([q.x,q.y,q.z,q.w]) * optical
+            alias.transform.rotation.x, alias.transform.rotation.y, alias.transform.rotation.z, alias.transform.rotation.w = map(float, rotation.as_quat())
+            self.static_tf.sendTransform(alias)
+            self.color_transform_ready = True
         if not self.poses:
             return
         tf = self.poses[-1]
@@ -103,7 +123,7 @@ class SimLooper(Node):
             self.high_pub.publish(self.make_pose(tf, self.get_clock().now().to_msg()))
             self.last_stamp = stamp
 
-    def on_images(self, left, depth):
+    def on_images(self, left, depth, color):
         if self.extrinsic is None or self.camera_info is None or not self.poses:
             return
         stamp = left.header.stamp
@@ -113,6 +133,13 @@ class SimLooper(Node):
         # Match the real-time consumer clock even when simulation slows down.
         # Raw simulation stamps remain the basis for pose/image association.
         output_stamp = self.get_clock().now().to_msg()
+        color = copy.deepcopy(color)
+        color.header.stamp = output_stamp
+        self.color_raw_pub.publish(color)
+        self.on_color(color)
+        color_info = copy.deepcopy(self.camera_info)
+        color_info.header = copy.deepcopy(color.header)
+        self.color_info_pub.publish(color_info)
         left = copy.deepcopy(left)
         depth = copy.deepcopy(depth)
         left.header.stamp = output_stamp

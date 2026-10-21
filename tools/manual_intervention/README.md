@@ -11,6 +11,9 @@ The Go2 sensor head also publishes aligned depth on `/sim/depth` for the
 Looper input adapter. `looper_source.py` converts images, depth, and Gazebo
 ground-truth poses to Looper-compatible topics. It uses the robot's TF camera
 extrinsics and Gazebo CameraInfo, rather than model-specific camera offsets.
+Color, infrared, depth, and visual poses share one output timestamp after
+association on the simulation clock. The adapter also publishes color camera
+intrinsics and the Looper camera transform used by offline mapping.
 This adapter supplies ground truth; it does not estimate VIO or inject faults.
 
 ## Start
@@ -33,7 +36,7 @@ Bridge the following Gazebo inputs into the application's ROS domain:
 | `/camera/camera/infra1/image_rect_raw` | `/sim/infra1` | sensor_msgs/msg/Image |
 | `/camera/camera/infra1/camera_info` | `/sim/camera_info` | sensor_msgs/msg/CameraInfo |
 | `/sim/depth` | `/sim/depth` | sensor_msgs/msg/Image |
-| `/camera/camera/color/image_raw` | same | sensor_msgs/msg/Image |
+| `/camera/camera/color/image_raw` | `/sim/color` | sensor_msgs/msg/Image |
 | `/clock` | `/clock` | rosgraph_msgs/msg/Clock |
 | `/world/<world>/dynamic_pose/info` | `/sim/world_pose` | tf2_msgs/msg/TFMessage |
 
