@@ -10,6 +10,9 @@
      -topic path drops every sensor pose). -->
 <robot name="go2_tinynav" xmlns:xacro="http://ros.org/wiki/xacro">
 
+  <xacro:arg name="kinematic" default="false"/>
+  <xacro:property name="kinematic" value="$(arg kinematic)"/>
+  <xacro:property name="stand_angle" value="${acos(0.25 / 0.426)}"/>
   <xacro:arg name="robot_name" default="robot1"/>
   <!-- absolute path of ros_control.yaml, passed by spawn.sh:
        GazeboSimROS2ControlPlugin loads it from inside the gz server -->
@@ -100,7 +103,7 @@
        hip-axis limit signs and the inertial off-diagonal signs. -->
   <xacro:macro name="leg" params="name mirror front_hind">
 
-    <joint name="${name}_hip_joint" type="revolute">
+    <joint name="${name}_hip_joint" type="${'fixed' if kinematic else 'revolute'}">
       <origin rpy="0 0 0" xyz="${front_hind*leg_offset_x} ${mirror*leg_offset_y} 0"/>
       <parent link="trunk"/>
       <child link="${name}_hip_link"/>
@@ -138,8 +141,8 @@
       </inertial>
     </link>
 
-    <joint name="${name}_upper_leg_joint" type="revolute">
-      <origin rpy="0 0 0" xyz="0 ${thigh_offset*mirror} 0"/>
+    <joint name="${name}_upper_leg_joint" type="${'fixed' if kinematic else 'revolute'}">
+      <origin rpy="0 ${stand_angle if kinematic else 0} 0" xyz="0 ${thigh_offset*mirror} 0"/>
       <parent link="${name}_hip_link"/>
       <child link="${name}_upper_leg_link"/>
       <axis xyz="0 1 0"/>
@@ -171,8 +174,8 @@
       </inertial>
     </link>
 
-    <joint name="${name}_lower_leg_joint" type="revolute">
-      <origin rpy="0 0 0" xyz="0 0 ${-thigh_length}"/>
+    <joint name="${name}_lower_leg_joint" type="${'fixed' if kinematic else 'revolute'}">
+      <origin rpy="0 ${-2*stand_angle if kinematic else 0} 0" xyz="0 0 ${-thigh_length}"/>
       <parent link="${name}_upper_leg_link"/>
       <child link="${name}_lower_leg_link"/>
       <axis xyz="0 1 0"/>
@@ -395,6 +398,7 @@
     </sensor>
   </gazebo>
 
+  <xacro:unless value="${kinematic}">
   <gazebo>
     <plugin name="gz_ros2_control::GazeboSimROS2ControlPlugin" filename="libign_ros2_control-system.so">
       <ros>
@@ -421,6 +425,10 @@
     <xacro:rc_joint name="rh_upper_leg_joint" init="0.944"/>
     <xacro:rc_joint name="rh_lower_leg_joint" init="-1.887"/>
   </ros2_control>
+  </xacro:unless>
+  <xacro:if value="${kinematic}">
+    <gazebo><static>true</static></gazebo>
+  </xacro:if>
 
   <!-- contact surfaces -->
   <gazebo reference="trunk">

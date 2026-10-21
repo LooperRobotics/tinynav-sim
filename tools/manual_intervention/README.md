@@ -1,11 +1,13 @@
 # Go2 simulation with the TinyNav application
 
-Use the existing Go2 model, joint controllers, gait controller, and velocity
-servo under `gazebo/robots/go2/`. Automatic and manual TinyNav commands both
-enter `/cmd_vel`; the existing servo feeds `/robot1/cmd_vel`. Do not bridge
-`/cmd_vel` to a separate Gazebo motion plugin or run another trajectory follower.
-The servo handles forward velocity, lateral velocity, and yaw through the same
-Go2 gait. Its existing skating-gait limitations still apply.
+Use the existing Go2 model with a fixed standing pose. Set
+`TINYNAV_GO2_MOTION=kinematic` when running `gazebo/robots/go2/spawn.sh`.
+In this mode the model is static and `/cmd_vel` updates its planar pose through
+Gazebo's `set_pose` service. No gait, joint controllers, or velocity servo run.
+Forward/backward, lateral motion, and yaw use body coordinates, with a 300 ms
+command timeout. Movement follows simulation time and stops while paused.
+This mode tests navigation and takeover, not leg dynamics or physical contact;
+direct pose updates can pass through obstacles.
 
 The Go2 sensor head also publishes aligned depth on `/sim/depth` for the
 Looper input adapter. `looper_source.py` converts images, depth, and Gazebo
@@ -21,14 +23,16 @@ This adapter supplies ground truth; it does not estimate VIO or inject faults.
 Run inside the development/simulation containers with the ROS environment
 loaded. The Gazebo container needs the existing Go2 dependencies: xacro,
 robot_state_publisher, ros_gz_sim, ign_ros2_control, controller_manager, and
-ros2_controllers. All ROS processes must share the same domain and DDS setup.
+ros2_controllers for gait mode. Kinematic mode only needs the model,
+robot_state_publisher, ros_gz_sim, and ros_gz_bridge. All ROS processes must share the same domain and DDS setup.
 For host-network containers on one machine, the existing
 `tools/probes/cyclone_localhost_unicast.xml` profile avoids cross-container
 shared-memory transport issues.
 
 Launch the existing Go2 world/spawn chain with the simulator's trajectory
 follower and keyboard teleop disabled; TinyNav owns these commands. The
-existing `gazebo/robots/go2/spawn.sh` starts the Go2 gait and velocity servo.
+`gazebo/robots/go2/spawn.sh` starts the pose controller and service bridge
+when `TINYNAV_GO2_MOTION=kinematic`; its default gait mode remains available.
 Bridge the following Gazebo inputs into the application's ROS domain:
 
 | Gazebo topic | ROS topic | ROS type |
@@ -38,7 +42,7 @@ Bridge the following Gazebo inputs into the application's ROS domain:
 | `/sim/depth` | `/sim/depth` | sensor_msgs/msg/Image |
 | `/camera/camera/color/image_raw` | `/sim/color` | sensor_msgs/msg/Image |
 | `/clock` | `/clock` | rosgraph_msgs/msg/Clock |
-| `/world/<world>/dynamic_pose/info` | `/sim/world_pose` | tf2_msgs/msg/TFMessage |
+| `/world/<world>/pose/info` | `/sim/world_pose` | tf2_msgs/msg/TFMessage |
 
 Run `python3 looper_source.py`. Defaults are model `go2`, body frame
 `base_link`, camera frame `camera_infra1_link`, and output prefix

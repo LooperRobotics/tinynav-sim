@@ -27,36 +27,28 @@ class CmdVelServo(Node):
     DT = 0.05          # 20 Hz loop
     STALE = 1.0        # seconds without gt_twist before feedforward-only
     FF_X = 13.0        # plant gain estimate for feedforward
-    FF_Y = 13.0
     FF_W = 0.7
 
     def __init__(self):
         super().__init__("cmd_vel_servo")
         self.declare_parameter("kp_x", 0.15)
         self.declare_parameter("ki_x", 0.25)
-        self.declare_parameter("kp_y", 0.15)
-        self.declare_parameter("ki_y", 0.25)
         self.declare_parameter("kp_w", 1.0)
         self.declare_parameter("ki_w", 0.5)
         self.declare_parameter("i_max_x", 0.12)   # integral headroom, plant units
-        self.declare_parameter("i_max_y", 0.04)
         self.declare_parameter("i_max_w", 0.5)
         self.declare_parameter("u_max_x", 0.044)  # inside the trot controller's clamp
-        self.declare_parameter("u_max_y", 0.014)
         self.declare_parameter("u_max_w", 0.9)
         g = lambda k: self.get_parameter(k).get_parameter_value().double_value
         self.kp_x, self.ki_x = g("kp_x"), g("ki_x")
-        self.kp_y, self.ki_y = g("kp_y"), g("ki_y")
-        self.i_max_y, self.u_max_y = g("i_max_y"), g("u_max_y")
         self.kp_w, self.ki_w = g("kp_w"), g("ki_w")
         self.i_max_x, self.i_max_w = g("i_max_x"), g("i_max_w")
         self.u_max_x, self.u_max_w = g("u_max_x"), g("u_max_w")
 
-        self.des = (0.0, 0.0, 0.0)
-        self.meas = (0.0, 0.0, 0.0)
+        self.des = (0.0, 0.0)
+        self.meas = (0.0, 0.0)
         self.meas_t = 0.0
         self.ix = 0.0
-        self.iy = 0.0
         self.iw = 0.0
         # absolute: planners and teleop publish /cmd_vel with no namespace;
         # the plant input below stays namespaced (/robot1/cmd_vel) so this
@@ -67,39 +59,34 @@ class CmdVelServo(Node):
         self.create_timer(self.DT, self.tick)
 
     def cb_des(self, m):
-        self.des = (m.linear.x, m.linear.y, m.angular.z)
+        self.des = (m.linear.x, m.angular.z)
 
     def cb_meas(self, m):
-        self.meas = (m.linear.x, m.linear.y, m.angular.z)
+        self.meas = (m.linear.x, m.angular.z)
         self.meas_t = time.time()
 
     def tick(self):
-        dx, dy, dw = self.des
+        dx, dw = self.des
         out = Twist()
-        if abs(dx) < 0.02 and abs(dy) < 0.02 and abs(dw) < 0.05:
-            self.ix = self.iy = self.iw = 0.0
+        if abs(dx) < 0.02 and abs(dw) < 0.05:
+            self.ix = self.iw = 0.0
             self.pub.publish(out)
             return
         fresh = (time.time() - self.meas_t) < self.STALE
         if fresh:
             ex = dx - self.meas[0]
-            ey = dy - self.meas[1]
-            ew = dw - self.meas[2]
+            ew = dw - self.meas[1]
         else:
-            ex = ey = ew = 0.0
+            ex = ew = 0.0
         self.ix = clamp(self.ix + ex * self.DT, self.i_max_x)
-        self.iy = clamp(self.iy + ey * self.DT, self.i_max_y)
         self.iw = clamp(self.iw + ew * self.DT, self.i_max_w)
         if fresh:
             ux = self.kp_x * ex + self.ki_x * self.ix
-            uy = self.kp_y * ey + self.ki_y * self.iy
             uw = self.kp_w * ew + self.ki_w * self.iw
         else:
             ux = dx / self.FF_X
-            uy = dy / self.FF_Y
             uw = dw / self.FF_W
         out.linear.x = clamp(ux, self.u_max_x)
-        out.linear.y = clamp(uy, self.u_max_y)
         out.angular.z = clamp(uw, self.u_max_w)
         self.pub.publish(out)
 
