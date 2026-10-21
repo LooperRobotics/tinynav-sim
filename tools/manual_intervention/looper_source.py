@@ -1,6 +1,7 @@
 """Gazebo ground truth adapter for Looper bridge integration tests (not a VIO estimator)."""
 import copy
 import argparse
+from tf2_ros import Buffer, TransformListener, TransformException
 import cv2
 from cv_bridge import CvBridge
 from collections import deque
@@ -17,10 +18,17 @@ import message_filters
 
 
 class SimLooper(Node):
-    def __init__(self, prefix='/camera/camera'):
+    def __init__(self, prefix='/camera/camera', model='go2', camera_frame='camera_infra1_link'):
         super().__init__('sim_looper_source')
+        self.model = model
+        self.camera_frame = camera_frame
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.extrinsic = None
         self.prefix = prefix.rstrip('/')
         self.bridge = CvBridge()
+        self.camera_info = None
+        self.create_subscription(CameraInfo, '/sim/camera_info', self.on_camera_info, qos_profile_sensor_data)
         self.color_pub = self.create_publisher(CompressedImage, self.prefix + '/color/image_rect_raw/compressed', 5)
         self.color_sub = self.create_subscription(Image, '/camera/camera/color/image_raw', self.on_color, qos_profile_sensor_data)
         self.poses = deque(maxlen=1000)
@@ -44,6 +52,9 @@ class SimLooper(Node):
     def seconds(stamp):
         return stamp.sec + stamp.nanosec * 1e-9
 
+    def on_camera_info(self, msg):
+        self.camera_info = msg
+
     def on_color(self, msg):
         image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         ok, data = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, 75])
@@ -59,7 +70,7 @@ class SimLooper(Node):
         if self.clock is None:
             return
         for tf in msg.transforms:
-            if tf.child_frame_id == 'lekiwi':
+            if tf.child_frame_id == self.model:
                 tf = copy.deepcopy(tf)
                 tf.header.stamp = copy.deepcopy(self.clock)
                 self.poses.append(tf)
@@ -68,16 +79,22 @@ class SimLooper(Node):
     def make_pose(self, tf, stamp):
         t,q = tf.transform.translation, tf.transform.rotation
         body = Rotation.from_quat([q.x,q.y,q.z,q.w])
-        # SDF infra1 link is at (0.09, 0.0255, 0.100) relative to model;
-        # optical camera axes: +z forward, +x right, +y down.
-        position = np.array([t.x,t.y,t.z]) + body.apply([.09,.0255,.100])
-        optical = body * Rotation.from_matrix([[0,0,1],[-1,0,0],[0,-1,0]])
+        offset = self.extrinsic.transform.translation
+        rotation = self.extrinsic.transform.rotation
+        camera = Rotation.from_quat([rotation.x, rotation.y, rotation.z, rotation.w])
+        position = np.array([t.x,t.y,t.z]) + body.apply([offset.x,offset.y,offset.z])
+        optical = body * camera * Rotation.from_matrix([[0,0,1],[-1,0,0],[0,-1,0]])
         pose = PoseStamped(); pose.header.stamp = stamp; pose.header.frame_id = 'world'
         pose.pose.position.x,pose.pose.position.y,pose.pose.position.z = map(float,position)
         pose.pose.orientation.x,pose.pose.orientation.y,pose.pose.orientation.z,pose.pose.orientation.w = map(float,optical.as_quat())
         return pose
 
     def on_timer(self):
+        if self.extrinsic is None:
+            try:
+                self.extrinsic = self.tf_buffer.lookup_transform('base_link', self.camera_frame, rclpy.time.Time())
+            except TransformException:
+                return
         if not self.poses:
             return
         tf = self.poses[-1]
@@ -87,7 +104,7 @@ class SimLooper(Node):
             self.last_stamp = stamp
 
     def on_images(self, left, depth):
-        if not self.poses:
+        if self.extrinsic is None or self.camera_info is None or not self.poses:
             return
         stamp = left.header.stamp
         tf = min(self.poses, key=lambda p:abs(self.seconds(p.header.stamp)-self.seconds(stamp)))
@@ -100,11 +117,8 @@ class SimLooper(Node):
         depth = copy.deepcopy(depth)
         left.header.stamp = output_stamp
         depth.header.stamp = output_stamp
-        info = CameraInfo(); info.header = copy.deepcopy(left.header)
-        info.width=left.width; info.height=left.height
-        info.k=[272.,0.,272.,0.,272.,240.,0.,0.,1.]
-        info.p=[272.,0.,272.,0.,0.,272.,240.,0.,0.,0.,1.,0.]
-        info.r=[1.,0.,0.,0.,1.,0.,0.,0.,1.]; info.d=[0.]*5; info.distortion_model='plumb_bob'
+        info = copy.deepcopy(self.camera_info)
+        info.header = copy.deepcopy(left.header)
         self.info_pub.publish(info)
         self.visual_pub.publish(self.make_pose(tf,output_stamp))
         self.depth_pub.publish(depth)
@@ -117,8 +131,10 @@ class SimLooper(Node):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output-prefix', default='/camera/camera')
+    parser.add_argument('--model', default='go2')
+    parser.add_argument('--camera-frame', default='camera_infra1_link')
     args = parser.parse_args()
-    rclpy.init(args=[]); node=SimLooper(args.output_prefix)
+    rclpy.init(args=[]); node=SimLooper(args.output_prefix, args.model, args.camera_frame)
     try: rclpy.spin(node)
     finally: node.destroy_node(); rclpy.shutdown()
 

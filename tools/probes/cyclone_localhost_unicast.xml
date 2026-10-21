@@ -26,6 +26,7 @@
         <Peer address="127.0.0.1"/>
       </Peers>
       <ParticipantIndex>auto</ParticipantIndex>
+      <MaxAutoParticipantIndex>64</MaxAutoParticipantIndex>
     </Discovery>
   </Domain>
 </CycloneDDS>

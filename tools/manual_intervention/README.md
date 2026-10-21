@@ -1,59 +1,61 @@
-# TinyNav manual intervention integration
+# Go2 simulation with the TinyNav application
 
-This adapter feeds the Python TinyNav navigation stack through its Looper
-bridge. Gazebo provides images, depth, and ground-truth camera poses. It is
-not a VIO estimator and does not inject odometry faults.
+Use the existing Go2 model, joint controllers, gait controller, and velocity
+servo under `gazebo/robots/go2/`. Automatic and manual TinyNav commands both
+enter `/cmd_vel`; the existing servo feeds `/robot1/cmd_vel`. Do not bridge
+`/cmd_vel` to a separate Gazebo motion plugin or run another trajectory follower.
+The servo handles forward velocity, lateral velocity, and yaw through the same
+Go2 gait. Its existing skating-gait limitations still apply.
 
-The home setup uses the `yard` world, the `lekiwi` model, Gazebo Fortress,
-`IGN_PARTITION=tinynav_home_42`, and ROS domain 42. Keep the ROS bridge, this
-adapter, and TinyNav in the same container and DDS configuration.
+The Go2 sensor head also publishes aligned depth on `/sim/depth` for the
+Looper input adapter. `looper_source.py` converts images, depth, and Gazebo
+ground-truth poses to Looper-compatible topics. It uses the robot's TF camera
+extrinsics and Gazebo CameraInfo, rather than model-specific camera offsets.
+This adapter supplies ground truth; it does not estimate VIO or inject faults.
 
-## Model and bridge
+## Start
 
-`configure_world.py INPUT --output OUTPUT` replaces the expanded lekiwi
-model's differential-drive plugin with Gazebo's VelocityControl system on
-`/cmd_vel`. This is a planar kinematic control test: A/D really translate
-sideways, rather than rotating a differential-drive model. It does not model
-omnidirectional wheel dynamics. The input must already contain the expanded
-lekiwi model and working camera/depth sensors. Do not modify `reference/`.
+Run inside the development/simulation containers with the ROS environment
+loaded. The Gazebo container needs the existing Go2 dependencies: xacro,
+robot_state_publisher, ros_gz_sim, ign_ros2_control, controller_manager, and
+ros2_controllers. All ROS processes must share the same domain and DDS setup.
+For host-network containers on one machine, the existing
+`tools/probes/cyclone_localhost_unicast.xml` profile avoids cross-container
+shared-memory transport issues.
 
-Bridge the following Gazebo topics into ROS:
+Launch the existing Go2 world/spawn chain with the simulator's trajectory
+follower and keyboard teleop disabled; TinyNav owns these commands. The
+existing `gazebo/robots/go2/spawn.sh` starts the Go2 gait and velocity servo.
+Bridge the following Gazebo inputs into the application's ROS domain:
 
 | Gazebo topic | ROS topic | ROS type |
 |---|---|---|
-| `/sim/infra1` | `/sim/infra1` | sensor_msgs/msg/Image |
+| `/camera/camera/infra1/image_rect_raw` | `/sim/infra1` | sensor_msgs/msg/Image |
+| `/camera/camera/infra1/camera_info` | `/sim/camera_info` | sensor_msgs/msg/CameraInfo |
 | `/sim/depth` | `/sim/depth` | sensor_msgs/msg/Image |
 | `/camera/camera/color/image_raw` | same | sensor_msgs/msg/Image |
 | `/clock` | `/clock` | rosgraph_msgs/msg/Clock |
-| `/world/yard/dynamic_pose/info` | `/sim/world_pose` | tf2_msgs/msg/TFMessage |
+| `/world/<world>/dynamic_pose/info` | `/sim/world_pose` | tf2_msgs/msg/TFMessage |
 
-Bridge ROS `/cmd_vel` (geometry_msgs/msg/Twist) to Gazebo `/cmd_vel`.
-Run `python3 looper_source.py` in the ROS container. Its default output prefix
-is `/camera/camera`, matching TinyNav's Looper bridge. Output uses consumer
-clock stamps; camera/pose association uses the original simulation clock.
+Run `python3 looper_source.py`. Defaults are model `go2`, body frame
+`base_link`, camera frame `camera_infra1_link`, and output prefix
+`/camera/camera`. Model and camera frame can be selected with `--model` and
+`--camera-frame`. The robot_state_publisher supplies the camera TF.
 
-Start the TinyNav backend with:
+Start the application backend with the stock Go2 configuration:
 
 ```bash
-export TINYNAV_DB_PATH=/tinynav/tinynav_db/sim-home
+export ROBOT_TYPE=go2
+export TINYNAV_DB_PATH=/tinynav/tinynav_db/sim-home-go2
 python3 run_tinynav.py
 ```
 
-`run_tinynav.py` keeps Gazebo-specific setup outside TinyNav: it selects the
-Looper input, disables physical chassis startup, and supplies LeKiwi geometry
-to the backend child processes. The installed TinyNav code is unchanged.
-Run it inside the development container with `/tinynav` mounted and the ROS
-environment loaded.
+The launcher only selects Looper input and skips the physical chassis driver;
+it does not replace robot geometry or node launch commands in TinyNav.
+Build the web frontend using the normal TinyNav workflow. Use a map recorded
+with the Go2 sensor head; maps made with a different camera height should be
+kept separately.
 
-## Verification
-
-With the isolated simulator idle, run `python3 verify.py` inside the ROS
-container using its DDS environment. It enters manual mode, confirms manual
-commands are not overwritten by automatic output, sends a command without a heartbeat, and checks
-that the backend times out and Gazebo stops. It exits manual mode on cleanup.
-
-For task retention, enable Nav, wait for Localized, send POIs, then Take control.
-Verify perception and planning keep updating, and manual arrival advances the
-POI queue or completes the task. Exit manual must immediately hand an unfinished
-task back to automatic control, without Resume. A task completed manually must
-stay completed. Cancel explicitly ends the task.
+Take control keeps perception, planning, and POI tracking running. Manual
+arrival can advance or complete a task. Exit manual hands an unfinished task
+back to automatic control without Continue.

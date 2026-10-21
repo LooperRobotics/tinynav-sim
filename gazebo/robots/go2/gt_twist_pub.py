@@ -34,6 +34,8 @@ class GtTwistPub(Node):
             return
         pt, px, py, pyaw = self.prev
         dt = t - pt
+        if dt < 0.02:
+            return
         if 0.02 <= dt <= 0.5:
             vx_w = (x - px) / dt
             vy_w = (y - py) / dt

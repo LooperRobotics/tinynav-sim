@@ -357,6 +357,20 @@
     </gazebo>
   </xacro:macro>
 
+  <gazebo reference="camera_infra1_link">
+    <sensor name="camera_depth" type="depth_camera">
+      <pose>0 0 0 0 0 0</pose>
+      <camera>
+        <horizontal_fov>1.5708</horizontal_fov>
+        <image><width>544</width><height>480</height><format>R_FLOAT32</format></image>
+        <clip><near>0.1</near><far>15</far></clip>
+      </camera>
+      <always_on>1</always_on>
+      <update_rate>15</update_rate>
+      <topic>/sim/depth</topic>
+    </sensor>
+  </gazebo>
+
   <!-- stereo pair + RGB, all on the head -->
   <xacro:sensor_link name="camera_infra1" x="${head_x}" y="${cam_y}" z="${head_z}"/>
   <xacro:sensor_link name="camera_infra2" x="${head_x}" y="-${cam_y}" z="${head_z}"/>
