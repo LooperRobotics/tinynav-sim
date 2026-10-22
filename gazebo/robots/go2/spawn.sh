@@ -16,7 +16,11 @@
 
 DIR=${TINYNAV_ROBOT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}
 WORLD_NAME=${TINYNAV_WORLD_NAME:?TINYNAV_WORLD_NAME not set}
+MOTION=${TINYNAV_GO2_MOTION:-gait}
+KINEMATIC=false
+if [[ "$MOTION" == kinematic ]]; then KINEMATIC=true; fi
 SPAWN_Z=${TINYNAV_SPAWN_Z:-0.35}
+if [[ "$KINEMATIC" == true ]]; then SPAWN_Z=0; fi
 NS=/robot1
 
 command -v ros2 >/dev/null 2>&1 || source /opt/ros/humble/setup.bash
@@ -26,7 +30,7 @@ cd "$DIR"
 echo "[go2] xacro"
 # ctl_config: the merged rig is a single self-contained xacro; the
 # GazeboSimROS2ControlPlugin still needs the controller yaml by absolute path
-ros2 run xacro xacro "$DIR/go2_tinynav.xacro" robot_name:=robot1 \
+ros2 run xacro xacro "$DIR/go2_tinynav.xacro" robot_name:=robot1 kinematic:=$KINEMATIC \
   ctl_config:=$DIR/ros_control.yaml > /tmp/go2_robot.urdf \
   || { echo "[go2] XACRO FAIL"; exit 1; }
 
@@ -60,6 +64,19 @@ pose: {position: {z: $SPAWN_Z}}, allow_renaming: true" \
     || { echo "[go2] SPAWN FAIL (service)"; kill $RSP; exit 1; }
 fi
 sleep 8
+
+if [[ "$KINEMATIC" == true ]]; then
+  ros2 run ros_gz_bridge parameter_bridge "/world/$WORLD_NAME/set_pose@ros_gz_interfaces/srv/SetEntityPose" \
+    > /tmp/go2_pose_bridge.log 2>&1 &
+  BRIDGE=$!
+  python3 "$DIR/../../../tools/manual_intervention/pose_control.py" --world "$WORLD_NAME" \
+    > /tmp/go2_pose_control.log 2>&1 &
+  CONTROL=$!
+  trap 'kill "$CONTROL" "$BRIDGE" "$RSP" 2>/dev/null' EXIT
+  echo "[go2] kinematic mode -- /cmd_vel moves the fixed-standing model"
+  wait "$RSP"
+  exit
+fi
 
 echo "[go2] controllers"
 timeout 45 ros2 run controller_manager spawner joint_state_broadcaster --ros-args -r __ns:=$NS \
