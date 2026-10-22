@@ -48,6 +48,31 @@ class TestStudentContract(unittest.TestCase):
         self.assertEqual((k.OBS_DIM, k.PROPRIO_HISTORY_DIM, k.NUM_ACTIONS),
                          (55, 550, 16))
 
+    def test_wheeled_v2_has_no_phase_and_a_brake(self):
+        meta = wheeled_metadata() | {
+            "contract": "go2w_depth_v2",
+            "observation_names": "base_ang_vel,projected_gravity,command,"
+                                 "joint_pos,joint_vel,actions",
+            "wheel_brake_rad_s": "1.16279",
+        }
+        k = V.StudentContract(meta)
+        self.assertEqual(k.OBSERVATION_TERM_DIMS, (3, 3, 3, 12, 16, 16))
+        self.assertEqual((k.OBS_DIM, k.PROPRIO_HISTORY_DIM), (53, 530))
+        self.assertAlmostEqual(k.wheel_brake_rad_s, 1.16279)
+        obs = k.build_proprioception(
+            np.zeros(3), (1.0, 0.0, 0.0, 0.0), np.array([0.5, 0.0, 0.0], np.float32),
+            k.default_joint_pos, np.zeros(16), np.zeros(16), control_step=7)
+        self.assertEqual(obs.shape, (53,))
+        np.testing.assert_allclose(obs[6:9], [0.5, 0.0, 0.0])   # command, then joint_pos
+        self.assertIsNone(V.StudentContract(wheeled_metadata()).wheel_brake_rad_s)
+
+    def test_observation_terms_out_of_order_are_refused(self):
+        meta = wheeled_metadata() | {
+            "observation_names": "projected_gravity,base_ang_vel,command,"
+                                 "joint_pos,joint_vel,actions"}
+        with self.assertRaises(ValueError):
+            V.StudentContract(meta)
+
     def test_legged_without_layout(self):
         meta = {"contract": "go2_depth_v2", "joint_names": ",".join(LEGS),
                 "default_joint_pos": ",".join(f"{v:.3f}" for v in C.DEFAULT_JOINT_POS),
@@ -97,6 +122,81 @@ class TestStudentContract(unittest.TestCase):
     def test_exports_without_contract_are_refused(self):
         with self.assertRaises(ValueError):    # e.g. the retired PIE policies
             V.contract_for({})
+
+
+def heading_metadata(contract: str = "go2_depth_v2_heading") -> dict[str, str]:
+    return {"contract": contract, "joint_names": ",".join(LEGS),
+            "default_joint_pos": ",".join(f"{v:.3f}" for v in C.DEFAULT_JOINT_POS),
+            "action_scale": "0.25",
+            "observation_names": ",".join(V.OBSERVATION_NAMES + (V.HEADING_TERM,))}
+
+
+def yaw_quat(yaw: float) -> tuple[float, float, float, float]:
+    return (np.cos(yaw / 2), 0.0, 0.0, np.sin(yaw / 2))
+
+
+class TestHeading(unittest.TestCase):
+    def test_heading_student_dims_and_envelope(self):
+        k = V.contract_for(heading_metadata())
+        self.assertTrue(k.heading)
+        self.assertEqual(k.OBSERVATION_TERM_DIMS[-1], 1)
+        self.assertEqual((k.OBS_DIM, k.PROPRIO_HISTORY_DIM), (48, 480))
+        # trained on go2-blind's command ranges
+        np.testing.assert_allclose(k.shape_command((2.0, -1.0, 2.0)), (1.5, -0.6, 1.5))
+        obs = k.build_proprioception(np.zeros(3), (1, 0, 0, 0), np.zeros(3),
+                                     k.default_joint_pos, np.zeros(12), np.zeros(12),
+                                     0, heading_error=0.25)
+        self.assertEqual(obs[-1], np.float32(0.25))
+        with self.assertRaises(ValueError):
+            k.build_proprioception(np.zeros(3), (1, 0, 0, 0), np.zeros(3),
+                                   k.default_joint_pos, np.zeros(12), np.zeros(12), 0)
+        self.assertIsInstance(k.HeadingError(), V.HeadingError)
+        self.assertIsNone(V.StudentContract(wheeled_metadata()).HeadingError())
+
+    def test_heading_contract_needs_the_term(self):
+        meta = heading_metadata() | {"observation_names": ",".join(V.OBSERVATION_NAMES)}
+        with self.assertRaises(ValueError):
+            V.StudentContract(meta)
+        with self.assertRaises(ValueError):
+            V.StudentContract(heading_metadata("go2_depth_v2"))
+
+    def test_wheeled_heading_student(self):
+        meta = wheeled_metadata() | {
+            "contract": "go2w_depth_v2_heading",
+            "observation_names": "base_ang_vel,projected_gravity,command,"
+                                 "joint_pos,joint_vel,actions,heading_error",
+        }
+        k = V.StudentContract(meta)
+        self.assertEqual((k.OBS_DIM, k.PROPRIO_HISTORY_DIM), (54, 540))
+
+    def test_heading_blind_export(self):
+        meta = heading_metadata()
+        del meta["contract"]
+        k = V.contract_for(meta, ["obs"])
+        self.assertIsInstance(k, V.BlindContract)
+        self.assertEqual(k.OBS_DIM, 48)
+
+    def test_heading_error_settles_integrates_and_clamps(self):
+        h = V.HeadingError()
+        # target = base yaw for the first two steps, whatever the command
+        self.assertEqual(h(yaw_quat(0.3), 1.0), 0.0)
+        self.assertEqual(h(yaw_quat(0.4), 1.0), 0.0)
+        # then it integrates the yaw-rate command (rad/s) every 0.02 s step
+        self.assertAlmostEqual(h(yaw_quat(0.4), 1.0), 0.02, places=6)
+        self.assertAlmostEqual(h(yaw_quat(0.4), 1.0), 0.04, places=6)
+        # held within 0.5 rad of the base yaw: a stalled turn saturates, and
+        # the error unwinds as soon as the robot turns
+        for _ in range(100):
+            error = h(yaw_quat(0.4), 1.0)
+        self.assertAlmostEqual(error, 0.5, places=6)
+        self.assertAlmostEqual(h(yaw_quat(0.8), 0.0), 0.1, places=6)
+        # wrapped across +-pi: turned 0.083 rad left past the target
+        h = V.HeadingError()
+        h(yaw_quat(3.1), 0.0)
+        h(yaw_quat(3.1), 0.0)
+        self.assertAlmostEqual(h(yaw_quat(-3.1), 0.0), 6.2 - 2 * np.pi, places=5)
+        h.reset()
+        self.assertEqual(h(yaw_quat(1.0), 1.0), 0.0)
 
 
 if __name__ == "__main__":

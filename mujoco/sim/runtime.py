@@ -106,6 +106,8 @@ class PieRuntime:
         self._bind_contract()
         self.last_action = np.zeros(self.contract.NUM_ACTIONS, dtype=np.float32)
         self.proprio_history = self.contract.ProprioHistory()
+        # heading_error state (heading contracts; None otherwise)
+        self.heading = self.contract.HeadingError()
         self.depth_history = C.DepthHistory()
         self.control_step = 0
         self.latest_raw_depth = None
@@ -134,7 +136,8 @@ class PieRuntime:
         meta = getattr(self.policy, "metadata", {})
         gains = {key: [float(v) for v in meta[key].split(",")]
                  for key in ("joint_stiffness", "joint_damping") if key in meta}
-        # (actuator ids, slice of the action vector, scale, default or None)
+        # (actuator ids, slice of the action vector, scale, default or None,
+        # joint dof addresses)
         self._action_map = []
         start = 0
         for group in k.action_groups:
@@ -143,7 +146,8 @@ class PieRuntime:
             stop = start + len(ids)
             offset = default[jidx] if group.kind == "position" else None
             self._action_map.append((ids, slice(start, stop),
-                                     np.float32(group.scale), offset))
+                                     np.float32(group.scale), offset,
+                                     self._dof_adr[jidx]))
             start = stop
             if group.kind == "position" and len(gains) == 2:
                 kp = np.asarray(gains["joint_stiffness"])[jidx]
@@ -171,6 +175,8 @@ class PieRuntime:
         reset_to_spawn(self.model, self.data, self.b, settle=True)
         self.last_action.fill(0.0)
         self.proprio_history.reset()
+        if self.heading is not None:
+            self.heading.reset()
         self.depth_history.reset()
         self.policy.reset()
         self.control_step = 0
@@ -188,9 +194,12 @@ class PieRuntime:
         # Students: training command envelope + deadzone, and the gait phase
         # clock counted from the last reset (control_step). PIE: unshaped.
         self.command = self.contract.shape_command(command)
+        heading_error = (None if self.heading is None
+                         else self.heading(quaternion, self.command[2]))
         return self.contract.build_proprioception(
             angular_velocity, quaternion, self.command,
             joint_pos, joint_vel, self.last_action, self.control_step,
+            heading_error=heading_error,
         )
 
     def depth_frame(self) -> np.ndarray | None:
@@ -209,6 +218,8 @@ class PieRuntime:
                        pos=self._spawn_pos, yaw_deg=self._spawn_yaw_deg)
         self.last_action.fill(0.0)
         self.proprio_history.reset()
+        if self.heading is not None:
+            self.heading.reset()
         self.depth_history.reset()
         self.policy.reset()
         self.control_step = 0
@@ -244,12 +255,17 @@ class PieRuntime:
             self.depth_history.array if self.uses_depth else None,
         )
         self.policy_ms = (time.perf_counter() - t0) * 1e3
-        for ids, part, scale, offset in self._action_map:
+        brake = getattr(self.contract, "wheel_brake_rad_s", None)
+        for ids, part, scale, offset, dof in self._action_map:
             # position: default pose + scale * action; velocity: scale * action
             target = scale * action[part]
             if offset is not None:
                 target = np.clip(offset + target, offset - ACTION_CLIP_RAD,
                                  offset + ACTION_CLIP_RAD)
+            elif (brake is not None and not np.any(self.command)
+                  and np.all(np.abs(self.data.qvel[dof]) < brake)):
+                # Low-speed brake at a zero command, as in training.
+                target = np.zeros_like(target)
             if not np.all(np.isfinite(target)):
                 raise FloatingPointError("policy actuator target is non-finite")
             self.data.ctrl[ids] = target

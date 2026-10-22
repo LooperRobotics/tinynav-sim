@@ -53,7 +53,10 @@ mujoco/
 资产来源：**不入 git 的大资产统一走 `model/` 资产包**——把 `model.zip`
 解压到仓根即得（`model/splat/` = 场景，`model/go2/` = 减面网格；包内自带
 `VERSION.txt` 与 `MANIFEST.sha256`，解压后 `sha256sum -c MANIFEST.sha256`
-验包）。重打包：`bash mujoco/scripts/pack_model.sh`（自动重生成
+验包）。现在的机体要 2026-10-22 版的包（VERSION.txt 写明版本，2026-10-19 版的网格对不上）；
+已有旧包时可只换机体网格：删掉 model/ 下 go2 go2w as2 as2w b2 b2w 六个目录，再解压
+只含这六个目录与 VERSION.txt、MANIFEST.sha256 的小包，splat 不变。
+重打包：`bash mujoco/scripts/pack_model.sh`（自动重生成
 MANIFEST.sha256 再 zip，默认输出到仓外 `../model.zip`）。运行期查找链：
 环境变量 `ROBOT_ASSETS` → 仓内 `model/` → 旧
 `~/workspace/dm/robot-assets` checkout；mjsim 镜像把整个包烤在镜像内
@@ -185,14 +188,13 @@ yaw −11.5°——狗眼 0.45m 只有低采段渲染干净，**换出生点先 
 
 ## 机型、策略与网页操作面板
 
-机型注册表 `sim/robots.py`：go2（go2_pie.xml 机体，执行器常量取
-sim/contract.py，与训练一致）、go2w、as2、as2w、
-b2、b2w。后五个的 MJCF 是训练仓（unitree_rl_mjlab 分支 go2-depth）用
+机型注册表 `sim/robots.py`：go2、go2w、as2、as2w、b2、b2w，机体都是 go2-blind 的
+机器人模型：MJCF 是训练仓（unitree_rl_mjlab 分支 go2-depth）用
 `scripts/go2_depth/export_sim_robot.py` 导出的训练原样机体（执行器 PD /
-力矩上限 / armature、碰撞配置、轮子球形碰撞都在 XML 里，勿手改，改了重导）；
-视觉网格是 `scripts/decimate_mesh.py` 减面后的 MSH（open3d quadric 保 15%，
-同 go2），放 model/ 资产包 `model/<robot>/assets`（go2w 机体网格 = go2 的
-MSH + wheel）。深度相机安装位取训练值——**只有 Go2 是实测外参，其余机型是
+力矩上限 / armature、碰撞配置、轮子球形碰撞都在 XML 里，勿手改，改了重导；
+旧的 PIE 机体 go2_pie.xml 已不在注册表里）；视觉网格是同一次导出的网格经
+`scripts/decimate_mesh.py` 减面后的 MSH（open3d quadric 保 15%），放 model/ 资产包
+`model/<robot>/assets`。深度相机安装位取训练值——**只有 Go2 是实测外参，其余机型是
 按 Go2 方式放在头前的估计值**。场景与出生点通用，出生高度按机型
 （`spawn_drop`）。
 
@@ -202,19 +204,47 @@ MSH + wheel）。深度相机安装位取训练值——**只有 Go2 是实测�
 wz ±1.5），按 I/O 签名识别。关节目标与真机部署一致地截在默认角 ±2.0 rad 内
 （训练时没有截断，正常运行几乎碰不到）。ONNX 元数据 `contract` 选契约
 （`sim/contract_v2.py`）：go2_depth_v2 与 {as2,b2}_depth_v1 为 47 维，
-{go2w,b2w,as2w}_depth_v1 为 55 维（joint_pos 只含 12 个腿关节、joint_vel 含
-全部 16 个、动作 = 12 腿位置目标 ×0.25 + 4 轮速度目标 ×10，见元数据
-`action_layout`）；runtime 加载时按机体核对关节、默认姿态与 PD 增益，不匹配
-直接拒绝。现有策略：Go2（go2_depth_v2）、Go2-W（go2w_depth_v1）、AS2（as2_depth_v1）；
-其余机型训练中，网页里列为不可用并写明缺什么。
+go2w_depth_v1 为 55 维（joint_pos 只含 12 个腿关节、joint_vel 含全部 16 个、
+动作 = 12 腿位置目标 ×0.25 + 4 轮速度目标 ×10，见元数据 `action_layout`）；
+轮足 {go2w,b2w,as2w}_depth_v2 去掉步态相位（53 维，观测项以元数据
+`observation_names` 为准），并带低速刹车：指令为零且各轮都慢于元数据
+`wheel_brake_rad_s` 时，轮速目标置零（与训练一致）；航向学生（契约名为原契约加
+`_heading`，如 go2_depth_v2_heading）观测末尾多一维 heading_error：目标航向在复位后
+前两步取机体偏航，之后每个控制步积分整形后的 wz 指令，误差 = 目标 − 偏航（回绕到
+±π），限制在 ±0.5 rad（转不动时目标跟着机体，不累积），与训练和 go2-blind 部署一致；
+它们按 go2-blind 的指令包络训练（同盲策略）。runtime 加载时按机体核对关节、默认姿态与 PD 增益，不匹配
+直接拒绝。现有策略：每台一个感知航向学生（unitree_rl_mjlab go2-depth 的 heading 配方，
+在 go2-blind 的机体上训练：腿足 48 维带步态相位，轮足 54 维）与 go2-blind 的盲策略。
+as2、b2 的学生多做了一轮下楼限速微调（文件名带 `_cap`：落脚进度奖励按每步平均速度
+封顶在指令的 1.4 倍，unitree_rl_mjlab 133244e）；限速前的 model_7000 导出
+as2_depth_v1_heading、b2_depth_v1_heading（下楼约 3× / 4.5× 指令）留在 assets/policy/，
+不在注册表里。旧机体的学生（go2_depth_v2、go2w_depth_v1、as2_depth_v1、b2_depth_v1）
+与旧盲策略（go2_blind_v1、as2_blind_v0）也仍在，但不在注册表里：它们的机体已换掉。
 
-| 机型 | 策略 | 状态 |
+| 机型 | 感知策略 | 状态 |
 |---|---|---|
-| go2 | go2_depth_v2.onnx（学生 t8 model_1999） | map3 全场景 0 摔（16 次 × 场景） |
-| go2（盲） | go2_blind_v0.onnx（go2-blind 发布版 model_20000） | map3 各场景 16 次 0 摔，上楼与中途停走 100%；下楼贴时限（L0 1.99/2.0 m、R2b 0.99/1.0 m）；平地横移 ≈ 93% |
-| go2w | go2w_depth_v1.onnx（学生 model_7999） | 平地滚行、横移 ≈ 指令 43%（已知偏弱）；零指令会缓慢前蠕（平地 ~3 cm/s，梯口处停在边缘） |
-| as2 | as2_depth_v1.onnx（学生 model_7999） | map3 各场景 16 次 0 摔，上楼 100%；下楼偏慢（脚本时限内 L0 下 1.84/2.0 m、R2b 下 0.87/1.0 m） |
-| b2 / as2w / b2w | — | 训练中 |
+| go2 | go2_depth_v2_heading.onnx（model_6500） | map3 18 段到达 98.7% / 98.5%（1.25 倍时限 97.0% / 97.6%），上楼 1.08×、下楼 1.97× 指令速度；平地 0.5 → 0.51 m/s；R2b 下楼 0.4 → 0.57 m/s |
+| go2w | go2w_depth_v2_heading.onnx（model_7000） | map3 18 段 99.2% / 99.3%（1.25 倍时限无操作员 99.4%），上楼 1.13×、下楼 0.97× 指令速度；平地 0.5 → 0.56 m/s；R2b 下楼 0.4 → 0.39 m/s；梯上停 4 s 溜车 ≤ 2 cm（上楼途中）/ ≤ 11 cm（下楼途中） |
+| as2 | as2_depth_v1_heading_cap.onnx（heading_cap model_1999） | map3 18 段 100% / 99.9%（1.25 倍时限 92.4% / 93.9%），上楼 0.96×、下楼 0.91× 指令速度；平地 0.5 → 0.52 m/s；R2b 下楼 0.4 → 0.37 m/s |
+| as2w | as2w_depth_v2_heading.onnx（model_7000） | map3 18 段 99.7% / 99.8%（1.25 倍时限 99.8% / 99.8%），上楼 1.13×、下楼 0.97× 指令速度；平地 0.5 → 0.52 m/s；R2b 下楼 0.4 → 0.40 m/s；梯上停 4 s：上楼途中最多溜回一级（17 cm），下楼途中 ≤ 1 cm |
+| b2 | b2_depth_v1_heading_cap.onnx（heading_cap model_1000） | map3 18 段 100% / 100%（1.25 倍时限 96.2% / 96.7%），上楼 1.02×、下楼 0.94× 指令速度；平地 0.5 → 0.54 m/s；R2b 下楼 0.4 → 0.40 m/s |
+| b2w | b2w_depth_v2_heading.onnx（model_7000） | map3 18 段 100% / 100%（1.25 倍时限无操作员 100%），上楼 1.20×、下楼 1.00× 指令速度；平地 0.5 → 0.59 m/s（偏快约 20%）；R2b 下楼 0.4 → 0.42 m/s；梯上停 4 s 溜车 ≤ 12 cm（上）/ ≤ 4 cm（下） |
+
+map3 18 段 = unitree_rl_mjlab `scripts/go2_depth/eval_map3.py --set flights`（go2-blind 的
+18 段上下楼，每段 64 台，限时内爬升或下降到梯段高度的 85%、且此前没摔算到达），按 go2-blind
+的验收设置测：时限是按指令速度走完所需时间的 2 倍（`--time-slack 2.0`，即 go2-blind
+`scripts/go2_blind/eval_map3.py --time-scale 1.6`；unitree_rl_mjlab 617d769）；斜线前后为
+无 / 有操作员（扶航向、回中线），无操作员时上下楼指令都是 0.5 m/s（`--no-operator --down-vx 0.5`），
+有操作员时上楼 0.5、下楼 0.4 m/s。括号里是 1.25 倍时限、上楼 0.5 / 下楼 0.4 m/s 的到达率：
+as2、b2 按指令速度走，偏慢的在 1.25 倍时限里会超时。到达之后的摔倒不计（2 倍时限走得更远，
+as2w 无操作员有 3.4% 走过梯段后撞上尽头的墙）。速度倍数取上楼 0.5、下楼 0.4 m/s 时。
+其余数字为本仓 smoke.py（flat、down = R2b 8 级）与梯上停车测试，均 0 摔。
+
+盲策略（go2-blind 4fc13b4 deploy/robots/<robot>/config/policy/velocity/blind_v0）：
+go2_blind_v2（Go2 model_23400）、go2w_blind_v0（9497）、as2_blind_v1（9500）、
+as2w_blind_v0（8200）、b2_blind_v0（8999）、b2w_blind_v0（8700）；smoke flat / down / map3
+均 0 摔。go2-blind 自测 map3 18 段（同上面的验收设置，无 / 有操作员）：Go2 87.4 / 95.1%、
+As2 85.3 / 99.9%、B2 93.3 / 95.1%、As2W 81.0 / 100.0%。
 
 网页操作面板（`webpanel.py`，view/hil 共用，在页面右上角控制面板最上方）：
 
@@ -223,8 +253,13 @@ wz ±1.5），按 I/O 签名识别。关节目标与真机部署一致地截在�
   安装位）。
 - **Perception**：感知策略 ↔ 盲策略原地热切（机体状态保留，策略记忆/历史清空）。
 - **Gamepad**：手柄接管开关（与手柄 A 键双向同步）。
-- **Follow camera**（默认开）：相机在机器人正后上方（2.6 m、俯角 40°，位置
-  0.15 s / 朝向 0.6 s 低通），跟随移动与转向；关掉后相机交还鼠标。
+- **Track robot**（默认开）：相机在机器人正后上方（2.6 m、俯角 40°，位置
+  0.15 s / 朝向 0.6 s 低通），跟随移动与转向；关掉后相机停在原处，用鼠标或
+  W / S 前后、A / D 左右、Q 下降移动视角（先点一下网页）。mjviser 自带的
+  Track camera 勾选框已去掉：它把场景平移到原点再对准，和这里的跟随打架。
+- **Keyboard speed**：键盘按住时的速度占当前策略训练指令范围的百分比
+  （10–100%，默认 50%），切换机型或策略后按新范围算；面板里写着各方向的实际
+  速度和视角按键（键位见下文「键盘」）。
 - **Reset to spawn / Stop**、**Policy depth**：策略当前深度输入（60×86，
   10 Hz，turbo：近红、3 m 外深蓝），仅感知策略时显示；底部状态行（机型 · 策略 ·
   指令 · 手柄）。
@@ -277,7 +312,11 @@ tmux kill-session -t sim|mj            # 结束宿主会话
 ```
 
 键盘（hil/sim 都是 /dev/input 全局捕获，不依赖窗口焦点）：
-按住 ↑ vx +0.5、↓ vx −0.2、←/→ wz ±0.3、`,`/`.` vy ±0.3（横移）；松开后先
+按住 ↑ 前进、↓ 后退、←/→ 左右转、`,`/`.` 左右横移（vy）。速度 = 当前策略训练
+指令范围在该方向的端点 × 面板的 **Keyboard speed**（默认 50%）：盲策略（vx
+−1.0~1.5、vy ±0.6、wz ±1.5）在 50% 时前进 0.75、后退 0.5、横移 0.3、转向 0.75，
+深度学生（vx −0.5~1.0、vy ±0.5、wz ±1.2）是 0.5 / 0.25 / 0.25 / 0.6；没有策略
+范围的宿主（dog）仍用固定的 0.5 / 0.2 / 0.3 / 0.3。松开后先
 补发 1s 零速（flush，对齐 gazebo teleop），然后命令源转 idle。sim/mj 里 idle
 只反映在状态行（控制环仍喂零）；hil 里键盘是**覆盖层**——live/flush 键盘赢、
 idle 后 DDS /cmd_vel 恢复驱动（人手微调不抢栈的导航权）。hil 无 Space/R 键

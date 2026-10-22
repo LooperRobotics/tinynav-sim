@@ -107,7 +107,11 @@ def _meshdir(robot: Robot) -> Path:
 SPAWN_XYZ = (-6.0, 4.0, 12.173)
 SPAWN_YAW_DEG = 180.0
 SPAWN_DROP = 0.30       # base_link height above ground top at spawn
-SETTLE_STEPS = 300      # 1.5 s at dt 0.005, ctrl = default pose
+# 0.2 s at dt 0.005, ctrl = default pose: enough to land on the feet. The
+# policies are trained dropping from the spawn height and acting at once; a
+# longer hold at the default pose (1.5 s) sank the Go2-W (leg kp 20) to a
+# 0.29 m crouch from its 0.40 m stance, a start it had never seen, and it fell.
+SETTLE_STEPS = 40
 
 # Top of the R2b flight: landing_F4_east (top 11.802), facing -y down the
 # treads (8 steps to top 10.621 at y 2.94) -- the stairs-down eval start.

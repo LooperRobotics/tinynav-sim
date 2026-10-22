@@ -1,14 +1,19 @@
 """Policy contracts of the depth-student family and the blind policies.
 
 unitree_rl_mjlab Unitree-<Robot>-Depth-Student exports, one per robot:
-go2_depth_v2 (Go2), as2_depth_v1 / b2_depth_v1 (legged) and go2w_depth_v1 /
-b2w_depth_v1 / as2w_depth_v1 (wheel-legged). Physics rate, depth camera and
-depth preprocessing are the PIE contract's (sim/contract.py, imported, not
-copied); joints, default pose and action layout come from the ONNX metadata,
-so one class serves every robot:
+go2_depth_v2 (Go2), as2_depth_v1 / b2_depth_v1 (legged), go2w_depth_v1
+(wheel-legged) and the wheel-legged *_depth_v2 (go2w / b2w / as2w: no phase,
+low-speed brake). Physics rate, depth camera and depth preprocessing are the
+PIE contract's (sim/contract.py, imported, not copied); joints, default
+pose, observation terms and action layout come from the ONNX metadata, so
+one class serves every robot:
 
     base_ang_vel(3) projected_gravity(3) command(3) phase(2)
     joint_pos(P) joint_vel(J) actions(A)
+
+in that order, minus the terms the metadata `observation_names` leaves out
+(the wheel-legged v2 exports have no phase: 53-D), plus heading_error(1) last
+for the heading students (contract `<contract>_heading`, below).
 
 J = metadata joint_names (every joint, model order), P = the position-
 controlled joints of action_layout (legs; relative to the default pose --
@@ -22,7 +27,23 @@ from the last reset, and zero while |command| < 0.1 (training also zeroes
 commands up to that norm, so the same deadzone is applied to the command).
 Mirrors unitree_rl_mjlab src/tasks/velocity/mdp/observations.py::phase.
 
-BlindContract: unitree_rl_mjlab Unitree-Go2-Blind exports (blind_v0, branch
+Wheel brake (metadata `wheel_brake_rad_s`, wheel-legged v2): with the shaped
+command zero and every velocity-controlled joint slower than that, the
+velocity targets are zero (unitree_rl_mjlab mdp/wheel_action.py; applied by
+the runtime).
+
+Heading students (unitree_rl_mjlab Unitree-<Robot>-Depth-Student-Heading,
+contract `<student contract>_heading`, e.g. go2_depth_v2_heading): trained
+on go2-blind's straight walking with a heading-error input, so their command
+envelope is the blind joystick range. heading_error = the heading the
+command asks for minus the base heading (rad, wrapped, + = turn left): the
+target heading is the base yaw for the first two control steps after a
+reset, then integrates the shaped yaw-rate command every control step, held
+within +-0.5 rad of the base yaw (anti-windup when the robot cannot follow).
+HeadingError mirrors unitree_rl_mjlab mdp/observations.py::heading_error and
+the go2-blind deploy observation of the same name.
+
+BlindContract: unitree_rl_mjlab Unitree-{Go2,As2}-Blind exports (branch
 go2-blind). Same 47-D observation, no depth, no recurrent memory: the ONNX
 takes one `obs` input that IS the 10-frame term-major history (oldest
 first, reset backfilled -- TermHistory) and returns `actions`; its command
@@ -46,9 +67,15 @@ STUDENT_CONTRACTS = (
     "as2_depth_v1",
     "b2_depth_v1",
     "go2w_depth_v1",
-    "b2w_depth_v1",
-    "as2w_depth_v1",
+    "go2w_depth_v2",
+    "b2w_depth_v2",
+    "as2w_depth_v2",
 )
+HEADING_SUFFIX = "_heading"
+HEADING_CONTRACTS = tuple(
+    name + HEADING_SUFFIX
+    for name in ("go2_depth_v2", "as2_depth_v1", "b2_depth_v1",
+                 "go2w_depth_v2", "b2w_depth_v2", "as2w_depth_v2"))
 OBSERVATION_NAMES = (
     "base_ang_vel",
     "projected_gravity",
@@ -58,6 +85,7 @@ OBSERVATION_NAMES = (
     "joint_vel",
     "actions",
 )
+HEADING_TERM = "heading_error"
 
 GAIT_PERIOD_S = 0.6
 COMMAND_DEADZONE = 0.1
@@ -99,6 +127,39 @@ def phase(control_step: int, command: Sequence[float]) -> np.ndarray:
     t = (control_step * CONTROL_DT) % GAIT_PERIOD_S / GAIT_PERIOD_S
     return np.asarray((math.sin(2.0 * math.pi * t), math.cos(2.0 * math.pi * t)),
                       dtype=np.float32)
+
+
+HEADING_MAX_ERROR = 0.5
+HEADING_SETTLE_STEPS = 2
+
+
+def yaw_from_quaternion(quaternion_wxyz: Sequence[float]) -> float:
+    w, x, y, z = (float(v) for v in quaternion_wxyz)
+    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+class HeadingError:
+    """heading_error state for one robot: call once per control step."""
+
+    def __init__(self, max_error: float = HEADING_MAX_ERROR) -> None:
+        self.max_error = float(max_error)
+        self.reset()
+
+    def reset(self) -> None:
+        self.target = 0.0
+        self.settle = HEADING_SETTLE_STEPS
+
+    def __call__(self, quaternion_wxyz: Sequence[float], yaw_rate_command: float) -> float:
+        yaw = yaw_from_quaternion(quaternion_wxyz)
+        if self.settle > 0:
+            self.target = yaw
+            self.settle -= 1
+        else:
+            self.target += float(yaw_rate_command) * CONTROL_DT
+        error = math.atan2(math.sin(self.target - yaw), math.cos(self.target - yaw))
+        error = min(max(error, -self.max_error), self.max_error)
+        self.target = yaw + error
+        return error
 
 
 class TermHistory:
@@ -153,8 +214,11 @@ class StudentContract:
     def __init__(self, metadata: dict[str, str], name: str | None = None,
                  command_low=COMMAND_LOW, command_high=COMMAND_HIGH) -> None:
         self.name = name or metadata["contract"]
-        if name is None and self.name not in STUDENT_CONTRACTS:
+        if name is None and self.name not in STUDENT_CONTRACTS + HEADING_CONTRACTS:
             raise ValueError(f"Unknown ONNX policy contract {self.name!r}.")
+        if self.name in HEADING_CONTRACTS:
+            # go2-blind's command ranges (the heading recipe trains on them)
+            command_low, command_high = BLIND_COMMAND_LOW, BLIND_COMMAND_HIGH
         self.joint_names = tuple(metadata.get("joint_names", "").split(","))
         self.default_joint_pos = _floats(metadata, "default_joint_pos")
         if self.default_joint_pos.shape != (len(self.joint_names),):
@@ -176,9 +240,22 @@ class StudentContract:
         self._pos_index = np.asarray(
             [self.joint_names.index(j) for j in self.position_joints])
         self.NUM_ACTIONS = sum(len(g.joints) for g in self.action_groups)
-        self.OBSERVATION_NAMES = OBSERVATION_NAMES
-        self.OBSERVATION_TERM_DIMS = (3, 3, 3, 2, len(self.position_joints),
-                                      len(self.joint_names), self.NUM_ACTIONS)
+        names = tuple(filter(None, metadata.get(
+            "observation_names", ",".join(OBSERVATION_NAMES)).split(",")))
+        known = OBSERVATION_NAMES + (HEADING_TERM,)
+        if [n for n in known if n in names] != list(names):
+            raise ValueError(f"Unsupported observation terms {names}.")
+        self.heading = HEADING_TERM in names
+        if self.heading != (self.name in HEADING_CONTRACTS) and name is None:
+            raise ValueError(f"Contract {self.name!r} with observation terms {names}.")
+        self.OBSERVATION_NAMES = names
+        dims = {"base_ang_vel": 3, "projected_gravity": 3, "command": 3,
+                "phase": 2, "joint_pos": len(self.position_joints),
+                "joint_vel": len(self.joint_names), "actions": self.NUM_ACTIONS,
+                HEADING_TERM: 1}
+        self.OBSERVATION_TERM_DIMS = tuple(dims[n] for n in names)
+        brake = metadata.get("wheel_brake_rad_s")
+        self.wheel_brake_rad_s = float(brake) if brake else None
         self.OBS_DIM = sum(self.OBSERVATION_TERM_DIMS)
         self.PROPRIO_HISTORY_DIM = self.OBS_DIM * PROPRIO_HISTORY_LENGTH
         self.COMMAND_LOW = np.asarray(command_low, dtype=np.float32)
@@ -186,6 +263,10 @@ class StudentContract:
 
     def ProprioHistory(self) -> TermHistory:  # noqa: N802 -- contract surface
         return TermHistory(self.OBSERVATION_TERM_DIMS)
+
+    def HeadingError(self) -> HeadingError | None:  # noqa: N802 -- contract surface
+        """heading_error state for one robot, None without the term."""
+        return HeadingError() if self.heading else None
 
     def shape_command(self, command: Sequence[float]) -> np.ndarray:
         """Clip to the training envelope and apply the training deadzone."""
@@ -205,22 +286,31 @@ class StudentContract:
         joint_vel: Sequence[float],
         last_action: Sequence[float],
         control_step: int,
+        heading_error: float | None = None,
     ) -> np.ndarray:
-        """Observation; joint_pos/joint_vel in joint_names order and
-        `command` already shaped."""
+        """Observation; joint_pos/joint_vel in joint_names order, `command`
+        already shaped and `heading_error` this step's HeadingError value
+        (heading contracts only)."""
+        if self.heading and heading_error is None:
+            raise ValueError(f"{self.name} needs heading_error.")
         cmd = np.asarray(command, dtype=np.float32).reshape(3)
         rel = (np.asarray(joint_pos, dtype=np.float32).reshape(-1)
                - self.default_joint_pos)
-        values = (
-            np.asarray(base_ang_vel, dtype=np.float32).reshape(3),
-            projected_gravity(quaternion_wxyz),
-            cmd,
-            phase(control_step, cmd),
-            rel[self._pos_index],
-            np.asarray(joint_vel, dtype=np.float32).reshape(len(self.joint_names)),
-            np.asarray(last_action, dtype=np.float32).reshape(self.NUM_ACTIONS),
-        )
-        observation = np.concatenate(values).astype(np.float32, copy=False)
+        values = {
+            "base_ang_vel": np.asarray(base_ang_vel, dtype=np.float32).reshape(3),
+            "projected_gravity": projected_gravity(quaternion_wxyz),
+            "command": cmd,
+            "phase": phase(control_step, cmd),
+            "joint_pos": rel[self._pos_index],
+            "joint_vel": np.asarray(joint_vel, dtype=np.float32).reshape(
+                len(self.joint_names)),
+            "actions": np.asarray(last_action, dtype=np.float32).reshape(
+                self.NUM_ACTIONS),
+        }
+        if self.heading:
+            values[HEADING_TERM] = np.asarray((heading_error,), dtype=np.float32)
+        observation = np.concatenate(
+            [values[n] for n in self.OBSERVATION_NAMES]).astype(np.float32, copy=False)
         if observation.shape != (self.OBS_DIM,) or not np.all(np.isfinite(observation)):
             raise FloatingPointError(
                 f"Invalid {self.name} proprioception with shape {observation.shape}.")
@@ -228,8 +318,11 @@ class StudentContract:
 
 
 class BlindContract(StudentContract):
-    """Blind policy (Unitree-Go2-Blind export): the student observation with
-    the blind joystick envelope."""
+    """Blind policy (go2-blind Unitree-<Robot>-Blind exports): the student
+    observation with the blind joystick envelope. The wheel-legged ones have
+    no phase and come through mujoco/scripts/import_blind_policy.py, which
+    writes their policy joint order, action layout and brake into the
+    metadata."""
 
     def __init__(self, metadata: dict[str, str]) -> None:
         super().__init__(metadata, name="blind", command_low=BLIND_COMMAND_LOW,
@@ -244,12 +337,16 @@ def contract_for(metadata: dict[str, str],
     policies) is refused."""
     if "contract" in metadata:
         return StudentContract(metadata)
+    no_phase = tuple(n for n in OBSERVATION_NAMES if n != "phase")
     if (tuple(input_names) == ("obs",)
-            and metadata.get("observation_names") == ",".join(OBSERVATION_NAMES)):
+            and metadata.get("observation_names") in tuple(
+                ",".join(names + extra)
+                for names in (OBSERVATION_NAMES, no_phase)
+                for extra in ((), (HEADING_TERM,)))):
         return BlindContract(metadata)
     raise ValueError("ONNX is neither a depth-student export (metadata "
-                     f"'contract' in {', '.join(STUDENT_CONTRACTS)}) nor a "
-                     "blind export (single 'obs' input).")
+                     f"'contract' in {', '.join(STUDENT_CONTRACTS + HEADING_CONTRACTS)}) "
+                     "nor a blind export (single 'obs' input).")
 
 
 __all__ = [
@@ -257,6 +354,8 @@ __all__ = [
     "BlindContract",
     "COMMAND_HIGH",
     "COMMAND_LOW",
+    "HEADING_CONTRACTS",
+    "HeadingError",
     "STUDENT_CONTRACTS",
     "StudentContract",
     "TermHistory",
