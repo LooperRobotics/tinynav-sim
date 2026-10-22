@@ -66,3 +66,30 @@ kept separately.
 Take control keeps perception, planning, and POI tracking running. Manual
 arrival can advance or complete a task. Exit manual hands an unfinished task
 back to automatic control without Continue.
+
+## Front and rear units
+
+The Go2 xacro includes a second, identical 544x480 / 15 Hz stereo + RGB +
+aligned-depth unit at the rear, with a 51 mm stereo baseline and 180-degree
+mounting yaw. Both units include IMU sensors. Rear infra1 is at body
+`(-0.19, -0.0255, 0.36)` metres; front infra1 is at `(0.19, 0.0255, 0.36)`.
+
+Load the same ROS domain/DDS settings and `IGN_PARTITION` as Gazebo, then run:
+
+```bash
+bash tools/manual_intervention/bridge_looper.sh
+python3 tools/manual_intervention/looper_source.py --rear
+```
+
+The bridge uses `TINYNAV_WORLD_NAME` (default `yard`). Native rear images are
+remapped to `/sim/rear/{infra1,infra2,color,camera_info,depth}`; normalized Looper
+outputs use `/camera/rear/`. A shared bounded timestamp cache makes frames from
+the same simulation instant carry exactly the same output timestamp across
+both units. Pose/image association still uses simulation time. Unique rear TF
+aliases prevent the rear RGB transform overwriting the front mapping transform.
+Without `--rear`, the adapter publishes the original front unit only.
+
+In Pilot, enable the rear unit in Device > Cameras and save its installation.
+Pilot records the rig manifest with the bag, stores both directions at each
+keypose and fuses rear depth for occupancy/planning. The adapter still supplies
+Gazebo ground truth, not independently estimated front/rear VIO.

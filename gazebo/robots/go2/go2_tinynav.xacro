@@ -297,7 +297,7 @@
   <xacro:property name="head_z" value="0.09"/>
   <xacro:property name="cam_y" value="0.0255"/>
 
-  <xacro:macro name="sensor_link" params="name x y z">
+  <xacro:macro name="sensor_link" params="name x y z yaw:=0">
     <!-- NO visual: a visual near the camera origin would be rendered by the
          camera itself (inside its own bounding mesh) -->
     <link name="${name}_link">
@@ -307,7 +307,7 @@
       </inertial>
     </link>
     <joint name="${name}_joint" type="fixed">
-      <origin xyz="${x} ${y} ${z}" rpy="0 0 0"/>
+      <origin xyz="${x} ${y} ${z}" rpy="0 0 ${yaw}"/>
       <!-- the head rides the trunk: base_link is the ground-level model
            origin and would put the sensors underground -->
       <parent link="trunk"/>
@@ -360,6 +360,27 @@
     </gazebo>
   </xacro:macro>
 
+  <gazebo reference="rear_infra1_link">
+    <sensor name="rear_depth" type="depth_camera">
+      <pose>0 0 0 0 0 0</pose>
+      <camera>
+        <horizontal_fov>1.5708</horizontal_fov>
+        <image><width>544</width><height>480</height><format>R_FLOAT32</format></image>
+        <clip><near>0.1</near><far>15</far></clip>
+      </camera>
+      <always_on>1</always_on>
+      <update_rate>15</update_rate>
+      <topic>/sim/rear/depth</topic>
+    </sensor>
+  </gazebo>
+
+  <xacro:sensor_link name="rear_infra1" x="-${head_x}" y="-${cam_y}" z="${head_z}" yaw="${PI}"/>
+  <xacro:gz_camera name="rear_infra1" topic="/camera/rear/infra1/image_rect_raw" format="L8"/>
+  <xacro:sensor_link name="rear_infra2" x="-${head_x}" y="${cam_y}" z="${head_z}" yaw="${PI}"/>
+  <xacro:gz_camera name="rear_infra2" topic="/camera/rear/infra2/image_rect_raw" format="L8"/>
+  <xacro:sensor_link name="rear_color" x="-${head_x}" y="0" z="${head_z}" yaw="${PI}"/>
+  <xacro:gz_camera name="rear_color" topic="/camera/rear/color/image_raw" format="RGB_INT8"/>
+
   <gazebo reference="camera_infra1_link">
     <sensor name="camera_depth" type="depth_camera">
       <pose>0 0 0 0 0 0</pose>
@@ -392,6 +413,19 @@
       <update_rate>200</update_rate>
       <visualize>true</visualize>
       <topic>/camera/camera/imu</topic>
+      <!-- identity translation, same lumping reason as the cameras; the RPY
+           stays: it is the camera-convention rotation (body Z = forward) -->
+      <pose>0 0 0 1.5708 3.14159 1.5708</pose>
+    </sensor>
+  </gazebo>
+
+  <xacro:sensor_link name="rear_imu" x="-0.15" y="0" z="${head_z}" yaw="${PI}"/>
+  <gazebo reference="rear_imu_link">
+    <sensor name="rear_imu" type="imu">
+      <always_on>1</always_on>
+      <update_rate>200</update_rate>
+      <visualize>true</visualize>
+      <topic>/camera/rear/imu</topic>
       <!-- identity translation, same lumping reason as the cameras; the RPY
            stays: it is the camera-convention rotation (body Z = forward) -->
       <pose>0 0 0 1.5708 3.14159 1.5708</pose>
