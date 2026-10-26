@@ -41,12 +41,17 @@ def safe_name(topic: str) -> str:
 
 
 def decode_image(msg):
-    """sensor_msgs/Image -> 2D/3D array. dtype & channels from encoding/step."""
+    """sensor_msgs/Image -> 2D/3D array. dtype & channels from encoding/step.
+
+    `mono16` is the looper contract's depth encoding (uint16 mm); without the
+    explicit case it fell through to uint8 and decoded as a 2-channel image.
+    """
     enc = msg.encoding
     if "32F" in enc:
         dtype = np.float32
-    elif "16U" in enc or "16S" in enc:
-        dtype = np.uint16 if "16U" in enc else np.int16
+    elif "16U" in enc or "16S" in enc or enc.lower().startswith("mono16"):
+        dtype = np.uint16 if ("16U" in enc or enc.lower().startswith("mono16")) \
+            else np.int16
     else:
         dtype = np.uint8
     itemsize = np.dtype(dtype).itemsize
