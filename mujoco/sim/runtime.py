@@ -97,6 +97,18 @@ class PieRuntime:
         self.policy_ms = 0.0
         self.physics_ms = 0.0
         self._last_data_time = float(data.time)
+        # Blind policies carry their own PD gains (go2_rl_gym: kp=20 all,
+        # kd=0.5) and never read the depth render.
+        self.needs_depth = bool(getattr(policy, "needs_depth", True))
+        kp = getattr(policy, "kp", None)
+        kd = getattr(policy, "kd", None)
+        if kp is not None and kd is not None:
+            ids = self.b.actuator_ids
+            model.actuator_gainprm[ids, 0] = float(kp)
+            model.actuator_biasprm[ids, 1] = -float(kp)
+            model.actuator_biasprm[ids, 2] = -float(kd)
+            print(f"[RT] policy PD override kp={float(kp):g} "
+                  f"kd={float(kd):g}", flush=True)
 
     # -- state -------------------------------------------------------------
     def base_pos(self) -> np.ndarray:
@@ -163,7 +175,7 @@ class PieRuntime:
             self.reset()
             return
 
-        if self.control_step % C.DEPTH_UPDATE_PERIOD_STEPS == 0:
+        if self.needs_depth and self.control_step % C.DEPTH_UPDATE_PERIOD_STEPS == 0:
             raw_depth = self.camera.capture(self.data)
             self.latest_raw_depth = raw_depth
             self.depth_history.append(C.preprocess_depth_z(raw_depth))
@@ -174,7 +186,7 @@ class PieRuntime:
         action = self.policy(
             observation,
             self.proprio_history.array,
-            self.depth_history.array,
+            self.depth_history.array if self.needs_depth else None,
         )
         self.policy_ms = (time.perf_counter() - t0) * 1e3
         target = C.DEFAULT_JOINT_POS + C.ACTION_SCALE * action

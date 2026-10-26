@@ -203,11 +203,11 @@ def main() -> int:
     data = mujoco.MjData(model)
     reset_to_spawn(model, data, b, settle=True, pos=pos, yaw_deg=yaw_deg)
 
-    if policy_path is not None or expert_mode == "single":
-        from sim.policy import PieOnnxPolicy
-        policy = PieOnnxPolicy(Path(policy_path) if policy_path else ONNX,
-                               provider="cpu")
-    else:
+    from sim.policy import PieOnnxPolicy, load_policy
+    policy = load_policy(Path(policy_path) if policy_path else ONNX,
+                         provider="cpu")
+    if (isinstance(policy, PieOnnxPolicy) and policy_path is None
+            and expert_mode != "single"):
         from sim.expert import DualExpertPolicy
         policy = DualExpertPolicy(ONNX, FLAT_ONNX, mode=expert_mode,
                                   provider="cpu")

@@ -63,7 +63,7 @@ from sim.plant import (  # noqa: E402
     get_scene,
     reset_to_spawn,
 )
-from sim.policy import PieOnnxPolicy  # noqa: E402
+from sim.policy import PieOnnxPolicy, load_policy  # noqa: E402
 from sim.expert import DualExpertPolicy  # noqa: E402
 from sim.runtime import DepthCamera, PieRuntime  # noqa: E402
 from sim.keyboard import HoldCmd, KeyboardOverride  # noqa: E402
@@ -93,6 +93,11 @@ def main() -> int:
     sel = argv[0] if argv else "5070"
     scene_name = _argv_value("--scene", "map3")
     sc = get_scene(scene_name)
+    if sc.render == "mujoco":
+        raise SystemExit(
+            f"scene {scene_name!r} uses the native mujoco renderer; run it "
+            "through dog.py --contract (pilot emu), which has the MuJoCo "
+            "stereo/depth face")
     spawn = _argv_value("--spawn", sc.default_spawn)
     cam_hz = float(_argv_value("--cam-hz", "10.0"))
     view_hz = float(_argv_value("--view-hz", "10.0"))   # viewer.sync rate: CPU scales linearly (render-per-sync)
@@ -312,9 +317,9 @@ def main() -> int:
     _flat = "policy_24000_flat_omni.onnx"
     _primary = (Path(policy_path) if policy_path
                 else _HERE / "assets" / "policy" / sc.hil_policy)
-    if expert_mode == "single" or sc.hil_policy == _flat:
-        policy = PieOnnxPolicy(_primary, provider="cpu")
-    else:
+    policy = load_policy(_primary, provider="cpu")
+    if (isinstance(policy, PieOnnxPolicy) and expert_mode != "single"
+            and sc.hil_policy != _flat):
         policy = DualExpertPolicy(_primary, _HERE / "assets" / "policy" / _flat,
                                   mode=expert_mode, provider="cpu")
     rt = PieRuntime(model, b, data, policy, policy_cam, cmd_mux,

@@ -29,9 +29,10 @@ from sim.plant import (  # noqa: E402
     DOWN_YAW_DEG,
     build_flat_model,
     build_map3_model,
+    build_model,
     reset_to_spawn,
 )
-from sim.policy import PieOnnxPolicy  # noqa: E402
+from sim.policy import load_policy  # noqa: E402
 from sim.runtime import DepthCamera, PieRuntime  # noqa: E402
 
 ONNX = _HERE / "assets" / "policy" / "policy.onnx"
@@ -41,6 +42,8 @@ def run(mode: str, stand_s: float, walk_s: float, vx: float, wz: float,
         realtime: bool, onnx_path: str | None = None) -> int:
     if mode == "flat":
         model, b = build_flat_model()
+    elif mode == "floorplan":
+        model, b = build_model("floorplan")
     else:
         model, b = build_map3_model()
     data = mujoco_data(model)
@@ -52,8 +55,8 @@ def run(mode: str, stand_s: float, walk_s: float, vx: float, wz: float,
     print(f"[{mode}] spawn base={np.round(data.qpos[b.root_qpos_adr:][:3], 3)} "
           f"z-ground unknown (settled)")
 
-    policy = PieOnnxPolicy(Path(onnx_path) if onnx_path else ONNX,
-                           provider="cpu")
+    policy = load_policy(Path(onnx_path) if onnx_path else ONNX,
+                         provider="cpu")
     cam = DepthCamera(model, b.depth_camera_id)
     cmd = ConstantCmd(vx=0.0, wz=0.0)
     rt = PieRuntime(model, b, data, policy, cam, cmd)
@@ -97,7 +100,7 @@ def mujoco_data(model):
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("mode", choices=("flat", "map3", "down"))
+    ap.add_argument("mode", choices=("flat", "map3", "down", "floorplan"))
     ap.add_argument("--stand", type=float, default=1.0)
     ap.add_argument("--walk", type=float, default=10.0)
     ap.add_argument("--vx", type=float, default=0.5)
