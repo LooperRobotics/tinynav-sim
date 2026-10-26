@@ -1,5 +1,5 @@
 #!/bin/bash
-# Repack the model/ asset bundle (out-of-git: splat scenes + go2 meshes)
+# Repack the model/ asset bundle (out-of-git: splat scenes + robot meshes)
 # into model.zip. Regenerates MANIFEST.sha256 from the current files first,
 # so the manifest always describes exactly what ships. VERSION.txt is
 # hand-written provenance -- edit it when contents change; the script only
@@ -21,7 +21,9 @@ OUT="${1:-$MODEL/../model.zip}"
   echo "warn: $MODEL/VERSION.txt missing -- add provenance before shipping" >&2
 
 cd "$MODEL"
-sha256sum splat/* $(find go2 -type f | sort) > MANIFEST.sha256
+# robot mesh dirs = the sim/robots.py registry names present in the bundle
+ROBOTS=$(for r in go2 go2w as2 as2w b2 b2w; do [[ -d $r ]] && echo "$r"; done)
+sha256sum splat/* $(find $ROBOTS -type f | sort) > MANIFEST.sha256
 rm -f "$OUT"
 zip -q -r "$OUT" .
 echo "packed: $OUT ($(du -h "$OUT" | cut -f1))"

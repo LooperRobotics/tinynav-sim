@@ -1,6 +1,7 @@
 # MuJoCo dog sim: 策略驱动 + wgpu 3DGS 传感器视图 + HIL 双传输面
 
-Unitree Go2 由楼梯下坡策略（ONNX）驱动，在 map3 楼梯井里行走（MuJoCo 物理），
+Unitree 四足（默认 Go2，见机型注册表）由自训的深度策略（ONNX）驱动，在 map3
+楼梯井里行走（MuJoCo 物理），
 狗眼相机画面由 gausscam（原 splatsense）的 wgpu 管线渲染（3DGS）。整体跑在
 tinynav-sim 仓，作为"整体仿真"侧：既可以人机交互遛狗，也可以作为传感器源喂
 navcore 做验证。
@@ -10,19 +11,24 @@ navcore 做验证。
 ```
 mujoco/
 ├── README.md            本文件
-├── view.py              交互宿主：viser 网页 viewer（默认）+ splat；
-│                        --preview 才开 MJPEG 推流
+├── view.py              交互宿主：viser 网页 viewer（默认，含操作面板、运行中
+│                        切机型）；--preview 才建 splat 管线并开 MJPEG 推流
+├── webpanel.py          网页操作面板（view/hil 共用）：机型 / 感知 / 手柄 /
+│                        跟随相机 / Reset·Stop / 策略深度图
 ├── physics_view.py      纯物理 viewer 宿主（无 splat）——姿态/物理排查
-├── smoke.py             headless 验证：flat | map3 | down
+├── smoke.py             headless 验证：flat | map3 | down（--robot 选机型）
 ├── hil.py               HIL 宿主入口：rclpy 契约面直发 DDS（无桥、单传输）
 ├── sim/                 仿真核心包（与传输/显示无关）
 │   ├── contract.py      策略 I/O 契约（vendor 自上游 sim2sim，常量勿改）
+│   ├── contract_v2.py   深度学生策略契约族（按 ONNX 元数据：足式 47 维、
+│                        轮足 55 维，腿位置 + 轮速度动作）
+│   ├── robots.py        机型注册表：MJCF / 网格 / 相机安装位 / 感知·盲策略
 │   ├── policy.py        ONNX 策略会话（GRU memory + 元数据契约校验，CPU 单线程）
-│   ├── expert.py        双专家选择器（stairs+flat；vx 迟滞自动切 + CLI 强制档，
-│                        GRU 切换清零）
-│   ├── plant.py         世界搭建：map3 场景 + 机器人 + 执行器内 PD + rig 相机
+│   ├── plant.py         世界搭建：场景 + 注册表机型 + 执行器内 PD + rig 相机
 │   ├── runtime.py       50Hz 控制循环（深度 10Hz → obs → 策略 → 4×mj_step）
-│   └── keyboard.py      /dev/input 全局按键轮询（零依赖）
+│   ├── keyboard.py      /dev/input 全局按键轮询（零依赖）
+│   ├── gamepad.py       /dev/input 手柄（evdev 事件流，零依赖）
+│   └── tests/           纯逻辑单测（契约族、手柄；无需设备）
 ├── hil/                 HIL 发布面（Face 协议 + rclpy 实现，宿主循环共享）
 │   ├── __init__.py      Face 协议 + 传感器契约常量（话题/QoS/TF/内参）+ 采样槽
 │   └── ros.py           rclpy 发布面（节点名 /insight_full；rclpy 只在此导入）
@@ -33,17 +39,16 @@ mujoco/
 ├── assets/
 │   ├── mjcf/            map3 scene.xml + map3_collision.xml（123 box，唯一源）
 │   ├── .compose/        plant.py 运行时生成的预处理场景（gitignore，勿手改）
-│   ├── go2/             go2_pie.xml（PIE 策略变体骨架；网格在 model/ 资产包，见下）
-│   └── policy/          policy.onnx（= model_18997，PIE 楼梯策略，见
-│                        ../docs/stairs-map3-experiments.md）
-│                        + policy_24000_flat_omni.onnx（平地全向专家，
-│                        view.py 双专家 auto 的后退分支，见同文）
-│                        + go2_pie_blind_flat.onnx（本仓 mjlab 训的盲走
-│                        速度策略，floorplan 现役，见 train/README.md）
-│                        + go2_rl_gym_moe_*.onnx（外部盲走探针，不迁移）
+│   ├── go2/             go2_pie.xml（Go2 机体骨架；网格在 model/ 资产包，见下）
+│   ├── <robot>/         go2w/as2/as2w/b2/b2w 训练 MJCF（训练仓导出，含执行器与
+│                        碰撞配置，勿手改；网格在 model/<robot>/assets）
+│   ├── floorplan/       参数化平地楼梯平面场景的默认 YAML（sim/floorplan.py）
+│   └── policy/          <robot>_depth_v*.onnx（各机型深度学生，机型注册表用）
+│                        + go2_blind_v0.onnx（go2 盲走，注册表 blind 位）
 │                        + policy.sha256（训练侧校验清单）
 └── scripts/
     ├── launch.sh        统一 tmux 启动器（sim | mj | hil）
+    ├── decimate_mesh.py 机型视觉网格减面 → MSH（model/ 资产包用）
     ├── probe_viewer.py  X/GLFW 健康探测
     ├── render_floorplan_bev.py       静态 BEV 复核图（含任务点/环向）
     ├── render_floorplan_lap_video.py 进程内策略驱动的一圈视频（无 DDS）
@@ -67,11 +72,15 @@ map3_scene`，INRIA 布局，`from_ply` 直读 RAW 值）；`map2_scene.ply` 为
 MetaCam map_2 的 spirula 训练输出直拷（step-50000，2.98M 高斯，706MB）；
 `go2/` 为 robot-assets 仓的
 减面二进制 MSH（1.3MB，出处链/重生成方法见该仓 README——该仓本地
-checkout 尚无提交，网格版本以 MANIFEST 校验和为准）。
+checkout 尚无提交，网格版本以 MANIFEST 校验和为准）；`go2w/ as2/ as2w/ b2/
+b2w/` 为各机型减面 MSH（训练仓 unitree_rl_mjlab 网格 →
+`mujoco/scripts/decimate_mesh.py`，每个目录有 README 记出处）。
 历史：本仓 `assets/go2/assets/` 曾带 25.5MB menagerie OBJ，
 减面迁移后删除（上游 menagerie 与 splatsense examples 各有全量副本）。
-入库的 `policy.onnx` 来自 RL 训练仓（hash 见 policy.sha256，
-其 .pt 血缘在训练侧，本仓只带 onnx）。
+入库的策略 ONNX 来自 RL 训练仓 unitree_rl_mjlab（hash 见 policy.sha256，
+其 .pt 血缘在训练侧，本仓只带 onnx）。PIE 策略（policy.onnx = model_18997、
+policy_24000_flat_omni.onnx）与双专家选择器已于 2026-10 移除，统一用自训
+策略；实验档案见 ../docs/stairs-map3-experiments.md 与 git 历史。
 
 ## 命名约定
 
@@ -87,7 +96,7 @@ checkout 尚无提交，网格版本以 MANIFEST 校验和为准）。
 | 形态 | 入口 | 内容 | 用途 |
 |---|---|---|---|
 | hil（默认） | `hil.py` | DDS 契约面 + viser 网页 viewer（`--view glfw` 换原生窗） | 喂 navcore |
-| sim | `view.py` | viser 网页 viewer + 狗眼 splat（`--preview` 才推流），无 DDS | 人看/遥操 |
+| sim | `view.py` | viser 网页 viewer + 操作面板（切机型/感知/手柄/跟随相机/深度图）+ 狗眼 splat（`--preview` 才建并推流），无 DDS | 人看/遥操 |
 | mj | `physics_view.py` | 纯 viewer + 策略 | 物理排查 |
 | dog | `dog.py`（或 `bash docker/run-mujoco-sim.sh dog -- --profile as2`） | 底盘 emu：go2 身体 + 真机 Unitree-DDS 脸（rt/* 话题 + sport RPC + 机型 FSM 门控），状态回传默认 20Hz | 多机型 pilot 驱动联调 |
 
@@ -112,12 +121,13 @@ OpenCV/Qt 窗口形态已废除（混合图形机器上 Qt 是四客户端
 
 场景：`plant.SCENES` 注册表，hil/sim/mj/dog 都吃
 `--scene map3|map2|floorplan`（默认 map3）。**map3** = 楼梯井（123 box
-精确碰撞，出生 F1 正对 L0 梯段，hil 载楼梯专家 18997）。**map2** = MetaCam
-map_2 室内（spirula 50k，2.98M 高斯；平地 box + 边界墙碰撞，出生 `low` =
-gsplat 验证过的低采段点 (3.21,−5.54)，yaw −11.5°——狗眼 0.45m 只有低采段
-渲染干净，**换出生点先 `--preview` 渲两帧对质再走**；hil 载平地专家 24000，
-sim 双专家 auto 不变）。碰撞地面高度在 `map2_scene.xml` + 注册表各有一处，
-改要一起改；新场景 = 一份 mjcf + 注册表一个条目。
+精确碰撞，出生 F1 正对 L0 梯段）。**map2** = MetaCam map_2 室内（spirula
+50k，2.98M 高斯；平地 box + 边界墙碰撞，出生 `low` = gsplat 验证过的低采段点
+(3.21,−5.54)，yaw −11.5°——狗眼 0.45m 只有低采段渲染干净，**换出生点先
+`--preview` 渲两帧对质再走**）。**floorplan** = 参数化平地楼梯平面（纯平地
+planning 测试场景，见下节）。策略跟机型走、与场景无关（sim/robots.py）。
+碰撞地面高度在 `map2_scene.xml` + 注册表各有一处，改要一起改；新场景 =
+一份 mjcf + 注册表一个条目。
 
 ## floorplan：平地 planning 测试场景
 
@@ -186,27 +196,6 @@ nav 侧建图：沿环形走廊开一圈（真实 U 形），`path_climb` 全是
 （与前端手动目标同一机制），额外发 `/control/target_heading` 指定终点朝向，
 配合栈侧 cmd_vel_control 的"终点段"逻辑（0.4 m 内直进、到位后原地对齐）。
 
-### 盲走策略（floorplan 现役）
-
-`assets/policy/go2_pie_blind_flat.onnx` 是在本仓 `mujoco/train/` 里用
-mjlab 对**部署同一份 `go2_pie.xml` + PIE 执行器契约**训练的盲走速度策略
-（45-D 单帧本体质感观测，无深度、无 GRU、无视觉输入；命令包络
-vx -0.5~1.0 / vy ±0.3 / wz ±0.8）。`sim/policy.py:load_policy` 按 ONNX
-输入名 `proprio` 自动路由到 `PieBlindOnnxPolicy`（needs_depth=False，
-不覆盖 PD）。floorplan 场景的 `hil_policy` 已切到它；训练/验收链与坑
-见 `train/README.md`。
-
-部署运行时平地扫描（`sweep` 工具在训练工作区）：0.2→0.195、0.3→0.301、
-0.5→0.500、1.0→1.009 m/s，倒退 0.3/0.5 与螃蟹 ±0.2~0.3 在 97~104%，
-wz ±0.3~0.8 全跟踪，零指令站立稳定，全程零摔倒。残余弱项：0.1 m/s
-以下跟踪减半（盲策略没有线速度观测，低速只能靠运动学推断，属物理
-下限），0.05 以下按设计保持站立。
-
-此前试过的 `go2_rl_gym` 预训练盲走 actor（`go2_rl_gym_moe_{137k,164k}`
-.onnx，`Go2RlGymOnnxPolicy` 适配层保留）只在其自带 MuJoCo 模型里能走、
-进 PIE 模型就站桩——别人家的狗 + torque 执行器，教训是"策略必须训在
-部署那份模型上"。
-
 ### BEV 视频：采集直播状态，不要开环回放
 
 录 `/cmd_vel` 再喂给独立进程的 PieRuntime **不是**对栈行为的复现：录下的
@@ -252,7 +241,6 @@ ffmpeg -f rawvideo -pix_fmt rgb24 -s 854x480 -r 30 -i /tmp/live.raw \
 `docker/run-mujoco-sim.sh` 会 bind `mujoco/dog.py`、`mujoco/hil.py`、
 `mujoco/sim`、`mujoco/assets/floorplan`——改这些直接重启容器即可，不用
 docker cp（cp 的改动会被容器重建冲掉）。
-
 
 **[OPEN-1 →RESOLVED] 容器内 MuJoCo viewer "冻结"（已结案：不是冻结，是缺 sync）**
 
@@ -318,6 +306,58 @@ docker cp（cp 的改动会被容器重建冲掉）。
   NVIDIA ICD。宿主/容器两侧同组合实测都健康。驱动为 610.43.02（旧文档
   写 595 是与老 2060 机器记串，已全部更正）。
 
+## 机型、策略与网页操作面板
+
+机型注册表 `sim/robots.py`：go2（go2_pie.xml 机体，执行器常量取
+sim/contract.py，与训练一致）、go2w、as2、as2w、
+b2、b2w。后五个的 MJCF 是训练仓（unitree_rl_mjlab 分支 go2-depth）用
+`scripts/go2_depth/export_sim_robot.py` 导出的训练原样机体（执行器 PD /
+力矩上限 / armature、碰撞配置、轮子球形碰撞都在 XML 里，勿手改，改了重导）；
+视觉网格是 `scripts/decimate_mesh.py` 减面后的 MSH（open3d quadric 保 15%，
+同 go2），放 model/ 资产包 `model/<robot>/assets`（go2w 机体网格 = go2 的
+MSH + wheel）。深度相机安装位取训练值——**只有 Go2 是实测外参，其余机型是
+按 Go2 方式放在头前的估计值**。场景与出生点通用，出生高度按机型
+（`spawn_drop`）。
+
+策略按机型登记：`perception`（深度学生，默认）与 `blind`（盲策略；没有盲
+策略的机型感知开关锁定为开）。盲策略是 unitree_rl_mjlab go2-blind 分支的导出
+（单个 `obs` 输入 = 10 帧逐项历史，MLP，无深度；指令包络 vx −1.0~1.5、vy ±0.6、
+wz ±1.5），按 I/O 签名识别。关节目标与真机部署一致地截在默认角 ±2.0 rad 内
+（训练时没有截断，正常运行几乎碰不到）。ONNX 元数据 `contract` 选契约
+（`sim/contract_v2.py`）：go2_depth_v2 与 {as2,b2}_depth_v1 为 47 维，
+{go2w,b2w,as2w}_depth_v1 为 55 维（joint_pos 只含 12 个腿关节、joint_vel 含
+全部 16 个、动作 = 12 腿位置目标 ×0.25 + 4 轮速度目标 ×10，见元数据
+`action_layout`）；runtime 加载时按机体核对关节、默认姿态与 PD 增益，不匹配
+直接拒绝。现有策略：Go2（go2_depth_v2）、Go2-W（go2w_depth_v1）、AS2（as2_depth_v1）；
+其余机型训练中，网页里列为不可用并写明缺什么。
+
+| 机型 | 策略 | 状态 |
+|---|---|---|
+| go2 | go2_depth_v2.onnx（学生 t8 model_1999） | map3 全场景 0 摔（16 次 × 场景） |
+| go2（盲） | go2_blind_v0.onnx（go2-blind 发布版 model_20000） | map3 各场景 16 次 0 摔，上楼与中途停走 100%；下楼贴时限（L0 1.99/2.0 m、R2b 0.99/1.0 m）；平地横移 ≈ 93% |
+| go2w | go2w_depth_v1.onnx（学生 model_7999） | 平地滚行、横移 ≈ 指令 43%（已知偏弱）；零指令会缓慢前蠕（平地 ~3 cm/s，梯口处停在边缘） |
+| as2 | as2_depth_v1.onnx（学生 model_7999） | map3 各场景 16 次 0 摔，上楼 100%；下楼偏慢（脚本时限内 L0 下 1.84/2.0 m、R2b 下 0.87/1.0 m） |
+| b2 / as2w / b2w | — | 训练中 |
+
+网页操作面板（`webpanel.py`，view/hil 共用，在页面右上角控制面板最上方）：
+
+- **Robot**：view.py 运行中切换机型（重建机体、策略、web 场景，失败则保持原
+  机型并弹提示）；hil.py 只显示（`--robot` 启动时选，契约面在启动时测相机
+  安装位）。
+- **Perception**：感知策略 ↔ 盲策略原地热切（机体状态保留，策略记忆/历史清空）。
+- **Gamepad**：手柄接管开关（与手柄 A 键双向同步）。
+- **Follow camera**（默认开）：相机在机器人正后上方（2.6 m、俯角 40°，位置
+  0.15 s / 朝向 0.6 s 低通），跟随移动与转向；关掉后相机交还鼠标。
+- **Reset to spawn / Stop**、**Policy depth**：策略当前深度输入（60×86，
+  10 Hz，turbo：近红、3 m 外深蓝），仅感知策略时显示；底部状态行（机型 · 策略 ·
+  指令 · 手柄）。
+
+所有宿主（view / hil / dog / mj / smoke）都用注册表策略（go2 =
+go2_depth_v2）；`--policy <onnx>` 固定单个 ONNX，`--blind`（view）以盲策略
+启动。没有 `contract` 元数据的 ONNX（如旧 PIE 导出）会被拒绝。view.py 的
+splat 管线只在 `--preview` 时建立（它是唯一消费者），所以纯网页形态不再需要
+gausscam / splat 资产。
+
 ## HIL：DDS 契约面
 
 同一套宿主循环（hil.py）+ 同一份契约（hil/__init__.py），单一路径：rclpy
@@ -351,6 +391,8 @@ bash docker/run-mujoco-sim.sh          # 默认 hil：DDS 直发 + viser :8012 +
 bash docker/run-mujoco-sim.sh dog -- --profile go2 --iface <nic> --contract
                                        # 全栈 emu（dog.py）：viser :8012 同样默认起（--view none 关）
 bash mujoco/scripts/launch.sh sim      # 交互沙盒（会话 sim；viser :8012，--preview 加 MJPEG :8888）
+bash docker/run-mujoco-sim.sh sim --robot go2w --gamepad
+                                       # 同上，容器内；--robot 起始机型、--gamepad 手柄默认接管
 bash mujoco/scripts/launch.sh mj       # 物理排查（会话 mj，原生窗口）
 # hil 需要 rclpy —— 宿主 sim venv 无 ROS python，launch.sh 会拦截并打印
 # 容器路径；宿主 hil 会话同理。--view glfw 换原生窗、--no-viewer 关窗。
@@ -358,14 +400,19 @@ tmux kill-session -t sim|mj            # 结束宿主会话
 ```
 
 键盘（hil/sim 都是 /dev/input 全局捕获，不依赖窗口焦点）：
-按住 ↑ vx +0.5、↓ vx −0.2、←/→ wz ±0.3；松开后先补发 1s 零速（flush，对齐
-gazebo teleop），然后命令源转 idle。sim/mj 里 idle 只反映在状态行（控制环
-仍喂零）；hil 里键盘是**覆盖层**——live/flush 键盘赢、idle 后 DDS /cmd_vel
-恢复驱动（人手微调不抢栈的导航权）。hil 无 Space/R 键绑定：Reset/Stop 只在
-web viewer 按钮上，误按 R 永远不可能复位一个在跑的 HIL 会话。
-双专家选择器（sim/mj）默认 auto：↓ 自动切平地专家、其余指令走楼梯主力，无需任何
-按键操作（`--expert stairs|flat` 可强制单边）；切换时目标专家 GRU 清零，
-状态行 `exp=` 显示当前激活专家。
+按住 ↑ vx +0.5、↓ vx −0.2、←/→ wz ±0.3、`,`/`.` vy ±0.3（横移）；松开后先
+补发 1s 零速（flush，对齐 gazebo teleop），然后命令源转 idle。sim/mj 里 idle
+只反映在状态行（控制环仍喂零）；hil 里键盘是**覆盖层**——live/flush 键盘赢、
+idle 后 DDS /cmd_vel 恢复驱动（人手微调不抢栈的导航权）。hil 无 Space/R 键
+绑定：Reset/Stop 只在 web viewer 按钮上，误按 R 永远不可能复位一个在跑的
+HIL 会话。
+
+手柄（sim/gamepad.py，同样读宿主 /dev/input，USB/蓝牙均可，容器经
+run-mujoco-sim.sh 的 /dev/input 挂载可见；插拔 2s 内自动识别）：左摇杆
+vx（推满 = 训练包络上限 1.0，后拉 0.5）/vy（±0.5），右摇杆 X wz（±1.2），A
+开关手柄接管，B 按住急停（零指令）。接管开（`--gamepad`、面板勾选或按 A）
+时手柄驱动——摇杆回中即原地站立，不交还；hil 里手柄覆盖 DDS /cmd_vel，键盘
+再覆盖手柄。包络随当前策略的训练指令范围。
 
 ## 依赖
 

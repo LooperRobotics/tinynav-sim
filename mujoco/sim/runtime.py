@@ -7,6 +7,11 @@ Adapted from parkour_mjlab deploy/pie/sim2sim/go2_pie_sim2sim.py
 PHYSICS_STEPS_PER_CONTROL sub-steps (PD lives in the actuator model).
 The command source is injected (keyboard for the live host, scripted for
 headless smokes); the plant is pie_model's map3 or flat builder.
+
+The policy's contract (sim/contract_v2.py) decides the observation layout and
+which actuators its actions drive (leg position targets, wheel velocity
+targets), so any registered robot runs here; a policy whose joints are not
+the plant's is refused. Blind policies (no depth input) skip the camera.
 """
 
 from __future__ import annotations
@@ -18,6 +23,12 @@ import numpy as np
 
 from . import contract as C
 from .plant import Bindings, reset_to_spawn
+
+# Joint-target safety clamp around the default pose, as the real-robot deploy
+# applies it (go2-blind deploy.yaml: default +- 2.0 rad = raw action +- 8).
+# Training had none and it bites on ~0.005% of steps; last_action stays the
+# raw policy output.
+ACTION_CLIP_RAD = 2.0
 
 
 class DepthCamera:
@@ -89,26 +100,59 @@ class PieRuntime:
         # NOT from other threads). Used by the transport face to sample the
         # IMU and base pose at the full 200 Hz physics rate.
         self.substep_hook = substep_hook
-        self.last_action = np.zeros(C.NUM_ACTIONS, dtype=np.float32)
-        self.proprio_history = C.ProprioHistory()
+        # Contract of the loaded policy (PIE or a depth student).
+        self.contract = policy.contract
+        self.uses_depth = bool(getattr(policy, "uses_depth", True))
+        self._bind_contract()
+        self.last_action = np.zeros(self.contract.NUM_ACTIONS, dtype=np.float32)
+        self.proprio_history = self.contract.ProprioHistory()
         self.depth_history = C.DepthHistory()
         self.control_step = 0
         self.latest_raw_depth = None
+        self.command = np.zeros(3, dtype=np.float32)   # last command the policy saw
         self.policy_ms = 0.0
         self.physics_ms = 0.0
         self._last_data_time = float(data.time)
-        # Blind policies carry their own PD gains (go2_rl_gym: kp=20 all,
-        # kd=0.5) and never read the depth render.
-        self.needs_depth = bool(getattr(policy, "needs_depth", True))
-        kp = getattr(policy, "kp", None)
-        kd = getattr(policy, "kd", None)
-        if kp is not None and kd is not None:
-            ids = self.b.actuator_ids
-            model.actuator_gainprm[ids, 0] = float(kp)
-            model.actuator_biasprm[ids, 1] = -float(kp)
-            model.actuator_biasprm[ids, 2] = -float(kd)
-            print(f"[RT] policy PD override kp={float(kp):g} "
-                  f"kd={float(kd):g}", flush=True)
+
+    def _bind_contract(self) -> None:
+        """Map the contract's joints and action groups onto the plant, and
+        refuse a policy trained for another robot (joints, default pose or
+        PD gains differ)."""
+        k, b = self.contract, self.b
+        names = b.joint_names
+        if sorted(k.joint_names) != sorted(names):
+            raise ValueError(
+                f"policy contract {k.name!r} joints {k.joint_names} do not "
+                f"match robot {b.robot.name!r} joints {names}")
+        idx = np.asarray([names.index(j) for j in k.joint_names])
+        self._qpos_adr = b.joint_qpos_adr[idx]
+        self._dof_adr = b.joint_dof_adr[idx]
+        default = np.asarray(k.default_joint_pos, dtype=np.float32)
+        if not np.allclose(default, b.default_joint_pos[idx], atol=1e-3):
+            raise ValueError(f"policy {k.name!r} default pose does not match "
+                             f"robot {b.robot.name!r}")
+        meta = getattr(self.policy, "metadata", {})
+        gains = {key: [float(v) for v in meta[key].split(",")]
+                 for key in ("joint_stiffness", "joint_damping") if key in meta}
+        # (actuator ids, slice of the action vector, scale, default or None)
+        self._action_map = []
+        start = 0
+        for group in k.action_groups:
+            jidx = [k.joint_names.index(j) for j in group.joints]
+            ids = b.actuator_ids[[names.index(j) for j in group.joints]]
+            stop = start + len(ids)
+            offset = default[jidx] if group.kind == "position" else None
+            self._action_map.append((ids, slice(start, stop),
+                                     np.float32(group.scale), offset))
+            start = stop
+            if group.kind == "position" and len(gains) == 2:
+                kp = np.asarray(gains["joint_stiffness"])[jidx]
+                kd = np.asarray(gains["joint_damping"])[jidx]
+                if not (np.allclose(self.model.actuator_gainprm[ids, 0], kp, atol=1e-3)
+                        and np.allclose(-self.model.actuator_biasprm[ids, 2], kd,
+                                        atol=1e-3)):
+                    raise ValueError(f"policy {k.name!r} PD gains do not match "
+                                     f"robot {b.robot.name!r} actuators")
 
     # -- state -------------------------------------------------------------
     def base_pos(self) -> np.ndarray:
@@ -139,12 +183,22 @@ class PieRuntime:
         angular_velocity = self.data.sensordata[
             self.b.gyro_adr:self.b.gyro_adr + 3
         ]
-        joint_pos = self.data.qpos[self.b.joint_qpos_adr]
-        joint_vel = self.data.qvel[self.b.joint_dof_adr]
-        return C.build_proprioception(
-            angular_velocity, quaternion, command,
-            joint_pos, joint_vel, self.last_action,
+        joint_pos = self.data.qpos[self._qpos_adr]
+        joint_vel = self.data.qvel[self._dof_adr]
+        # Students: training command envelope + deadzone, and the gait phase
+        # clock counted from the last reset (control_step). PIE: unshaped.
+        self.command = self.contract.shape_command(command)
+        return self.contract.build_proprioception(
+            angular_velocity, quaternion, self.command,
+            joint_pos, joint_vel, self.last_action, self.control_step,
         )
+
+    def depth_frame(self) -> np.ndarray | None:
+        """Newest policy depth frame (60x86, ray depth / DEPTH_MAX_M), or
+        None for a blind policy / before the first capture."""
+        if not self.uses_depth or self.latest_raw_depth is None:
+            return None
+        return self.depth_history.array[-1]
 
     def _resettle_after_viewer_reset(self) -> None:
         """Recover from the viewer's Reset button: mj_resetData jumps to
@@ -175,7 +229,8 @@ class PieRuntime:
             self.reset()
             return
 
-        if self.needs_depth and self.control_step % C.DEPTH_UPDATE_PERIOD_STEPS == 0:
+        if (self.uses_depth
+                and self.control_step % C.DEPTH_UPDATE_PERIOD_STEPS == 0):
             raw_depth = self.camera.capture(self.data)
             self.latest_raw_depth = raw_depth
             self.depth_history.append(C.preprocess_depth_z(raw_depth))
@@ -186,13 +241,18 @@ class PieRuntime:
         action = self.policy(
             observation,
             self.proprio_history.array,
-            self.depth_history.array if self.needs_depth else None,
+            self.depth_history.array if self.uses_depth else None,
         )
         self.policy_ms = (time.perf_counter() - t0) * 1e3
-        target = C.DEFAULT_JOINT_POS + C.ACTION_SCALE * action
-        if not np.all(np.isfinite(target)):
-            raise FloatingPointError("PIE target joint position is non-finite")
-        self.data.ctrl[self.b.actuator_ids] = target
+        for ids, part, scale, offset in self._action_map:
+            # position: default pose + scale * action; velocity: scale * action
+            target = scale * action[part]
+            if offset is not None:
+                target = np.clip(offset + target, offset - ACTION_CLIP_RAD,
+                                 offset + ACTION_CLIP_RAD)
+            if not np.all(np.isfinite(target)):
+                raise FloatingPointError("policy actuator target is non-finite")
+            self.data.ctrl[ids] = target
         t0 = time.perf_counter()
         for _ in range(C.PHYSICS_STEPS_PER_CONTROL):
             mujoco.mj_step(self.model, self.data)

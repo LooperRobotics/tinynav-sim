@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Standalone MuJoCo host: PIE policy + map3 + viewer window only.
+"""Standalone MuJoCo host: robot policy + map3 + viewer window only.
 
 No wgpu splat, no OpenCV window — the viewer is the single X client
 (besides the EGL offscreen depth camera). Space stop / R reset live in
 the viewer callback; arrows are the global /dev/input poll. Run:
 
-  .venv*/bin/python physics_view.py [--spawn down|f4|flat1]
+  .venv*/bin/python physics_view.py [--spawn down|f4|flat1] [--robot go2]
 """
 from __future__ import annotations
 
@@ -39,6 +39,7 @@ from sim.plant import (  # noqa: E402
     reset_to_spawn,
 )
 from sim.policy import PieOnnxPolicy  # noqa: E402
+from sim.robots import DEFAULT_ROBOT, get_robot  # noqa: E402
 from sim.runtime import DepthCamera, PieRuntime  # noqa: E402
 
 CONTROL_DT = 0.02
@@ -57,11 +58,13 @@ def main() -> int:
         raise SystemExit(f"unknown spawn {spawn!r}; choose {sorted(sc.spawns)}")
     pos, yaw_deg = sc.spawns[spawn]
 
-    model, b = build_model(scene_name)
+    robot = get_robot(sys.argv[sys.argv.index("--robot") + 1]
+                      if "--robot" in sys.argv else DEFAULT_ROBOT)
+    model, b = build_model(scene_name, robot.name)
     model.vis.quality.shadowsize = 0          # shadows off (viewer + renders)
     data = mujoco.MjData(model)
 
-    policy = PieOnnxPolicy(_HERE / "assets" / "policy" / sc.hil_policy)
+    policy = PieOnnxPolicy(robot.policy_path("perception"))
     cmd = HoldCmd(use_global=True)
     cam = DepthCamera(model, b.depth_camera_id)
     reset_to_spawn(model, data, b, settle=True, pos=pos, yaw_deg=yaw_deg)

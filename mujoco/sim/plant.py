@@ -2,6 +2,10 @@
 """Plant models: map3 stairwell + flat smoke terrain, driven by the
 stair-descent policy.
 
+The robot is a registry entry (sim/robots.py). go2 keeps the PIE profile
+below; the other robots load their training MJCF (actuators and collision
+setup already in it) and only get the cameras and scene options added here.
+
 Adapts the PIE robot configuration from parkour_mjlab's native sim2sim
 (deploy/pie/sim2sim/go2_pie_sim2sim.py, train/orient-ablation) onto the
 splatsense map3 scene, mirroring training exactly:
@@ -19,7 +23,6 @@ splatsense map3 scene, mirroring training exactly:
 
 from __future__ import annotations
 
-import os
 import re
 import sys
 from dataclasses import dataclass
@@ -34,6 +37,7 @@ ASSETS = _HERE.parent / "assets"                 # .../mujoco/assets
 
 from . import contract as C  # noqa: E402
 from . import floorplan as floorplan  # noqa: E402
+from .robots import DEFAULT_ROBOT, Robot, get_robot  # noqa: E402
 
 
 def _preprocess_scene(scene_path: Path, workdir: Path) -> Path:
@@ -88,25 +92,18 @@ SCENE_XML = ASSETS / "mjcf" / "scene.xml"
 COLLISION_XML = ASSETS / "mjcf" / "map3_collision.xml"
 
 
-def _go2_meshdir() -> Path:
-    """go2 visual meshes ship in the model/ asset bundle (model.zip unpacked
-    at the repo root), NOT in git (mujoco/README.md, 资产来源). Search order:
+def _meshdir(robot: Robot) -> Path:
+    """Visual meshes ship in the model/ asset bundle (model.zip unpacked at
+    the repo root), NOT in git (mujoco/README.md, 资产来源). Search order:
     $ROBOT_ASSETS, the in-repo model/ bundle, then the legacy robot-assets
     checkout. The mjsim image bakes the bundle to /opt/model."""
-    repo = _HERE.parents[1]                         # .../tinynav-sim
-    candidates: list[Path] = []
-    if os.environ.get("ROBOT_ASSETS"):
-        candidates.append(Path(os.environ["ROBOT_ASSETS"]))
-    candidates += [repo / "model",
-                   Path.home() / "workspace" / "dm" / "robot-assets"]
-    for root in candidates:
-        d = root / "go2" / "assets"
-        if d.is_dir():
-            return d
-    raise FileNotFoundError(
-        "go2 meshes not found — unzip model.zip at the repo root "
-        "(creates model/go2/) or point ROBOT_ASSETS at the robot-assets "
-        "checkout")
+    d = robot.mesh_dir()
+    if d is None:
+        raise FileNotFoundError(
+            f"{robot.name} meshes not found — unzip model.zip at the repo root "
+            f"(creates model/{robot.name}/) or point ROBOT_ASSETS at the "
+            "robot-assets checkout")
+    return d
 
 # view_live proven spawn on the F1 slab, facing the L0 stair base (-x world).
 SPAWN_XYZ = (-6.0, 4.0, 12.173)
@@ -123,6 +120,11 @@ DOWN_YAW_DEG = 270.0
 # wgpu renderer poses off the same bodies in every profile.
 RIG_Y = {"infra1": 0.0255, "infra2": -0.0255, "color": 0.0}
 RIG_POS = [0.19, 0.0, 0.09]
+# Other heads: the rig keeps Go2's offset from the depth camera.
+RIG_FROM_DEPTH_CAMERA = np.subtract(RIG_POS, C.DEPTH_CAMERA_POS)
+# Camera shell visual (PIE sim2sim dims), same offset from the camera.
+SHELL_FROM_DEPTH_CAMERA = np.subtract((0.332784, 0.0, 0.074446),
+                                      C.DEPTH_CAMERA_POS)
 RIG_QUAT_WXYZ = [0.5, 0.5, -0.5, -0.5]
 RIG_FOVY = 82.85
 
@@ -141,8 +143,9 @@ DEPTH_CAMERA_NAME = "front_depth"
 @dataclass(frozen=True)
 class Scene:
     """One navigable world: mjcf (+ optional collision fragment), catch
-    floor, splat ply (model/splat/), named spawns, and the policy the hil
-    single-policy host loads. Register a new scene = one dict entry.
+    floor, splat ply (model/splat/) and named spawns. Policies belong to
+    the robot (sim/robots.py), not the scene. Register a new scene = one
+    dict entry.
     xml is None only for the procedural "flat" smoke terrain (built from
     a string, no mjcf file)."""
 
@@ -152,7 +155,6 @@ class Scene:
     ply: str
     spawns: dict
     default_spawn: str
-    hil_policy: str
     # "splat" = gausscam RGB+depth; "mujoco" = native Renderer stereo/depth
     render: str = "splat"
     # procedural scenes: builder(params) -> MjSpec, plus the matching box and
@@ -170,8 +172,6 @@ SCENES: dict[str, Scene] = {
     # flat smoke terrain: procedural ground plane + go2 (build_flat_model),
     # no walls and no catch cliff -- the emu bench's long-run scene. The
     # 20 m plane bounds the walk far before integrator drift matters.
-    # Policy = policy.onnx, the canonical smoke.py flat pairing (ladder
-    # step 2): the flat-omni expert also walks here but is kept on map2.
     "flat": Scene(
         xml=None,
         collision=None,
@@ -179,7 +179,6 @@ SCENES: dict[str, Scene] = {
         ply="",
         spawns={"origin": ((0.0, 0.0, 0.32), 0.0)},
         default_spawn="origin",
-        hil_policy="policy.onnx",
     ),
     # map3 stairwell: 123 exact collision boxes (Blender rebuild), F1 slab
     # tops at z=0, catch floor 5 cm below.
@@ -194,14 +193,12 @@ SCENES: dict[str, Scene] = {
             "flat1": ((-7.4, 4.0, 12.2), 180.0),
         },
         default_spawn="down",
-        hil_policy="policy.onnx",          # stairs expert model_18997
     ),
     # MetaCam map_2 indoor (spirula_ba_s2 step-50000, 2.98M gaussians).
     # Spawn = the gsplat-validated low-capture-band spot (map2_go2.json
     # initial_qpos, yaw -11.49); ground top -1.20 from the spawn-footprint
     # gaussian histogram -- see map2_scene.xml, recalibrate ground there
-    # AND here together by render. Flat indoor: hil loads the flat-omni
-    # expert, view keeps dual-expert auto.
+    # AND here together by render.
     "map2": Scene(
         xml=ASSETS / "mjcf" / "map2_scene.xml",
         collision=None,
@@ -209,7 +206,6 @@ SCENES: dict[str, Scene] = {
         ply="map2_scene.ply",
         spawns={"low": ((3.21, -5.54, -0.755), -11.49)},
         default_spawn="low",
-        hil_policy="policy_24000_flat_omni.onnx",
     ),
     # Parametric flat-floor stairwell plan for planning tests.  The physical
     # world is one flat floor; the "stairs" are only the plan view (two long
@@ -222,11 +218,9 @@ SCENES: dict[str, Scene] = {
         ply="",
         spawns=floorplan.floorplan_spawns(_FLOORPLAN_DEFAULT),
         default_spawn="w",
-        # Blind velocity actor trained on THIS robot/contract with mjlab
-        # (mujoco/train/): 45-D proprio, no depth render, no PD override.
-        # Sweep vs the flat-omni depth expert: 0.2->0.195 / 0.3->0.301 /
-        # 0.5->0.500 / 1.0->1.009, reverse/crab/yaw 97-104%, zero falls.
-        hil_policy="go2_pie_blind_flat.onnx",
+        # Policies belong to the robot registry (sim/robots.py); on this
+        # splat-less scene the go2 blind policy drives and the contract
+        # stereo/depth comes from the native MuJoCo renderer.
         render="mujoco",
         builder=floorplan.build_floorplan_spec,
         boxes_fn=floorplan.floorplan_boxes,
@@ -277,6 +271,12 @@ class Bindings:
     depth_camera_geom_id: int  # -1 when the camera shell is absent (flat)
     contract_left_camera_id: int
     contract_right_camera_id: int
+    # Actuated joints: PIE order for go2, model order for the other robots.
+    # joint_qpos_adr / joint_dof_adr / actuator_ids follow this order.
+    robot: Robot
+    joint_names: tuple[str, ...]
+    default_joint_pos: np.ndarray
+    ctrl_default: np.ndarray   # standing ctrl: default angle, 0 for wheels
 
 
 def _configure_robot_spec(spec: mujoco.MjSpec) -> None:
@@ -332,31 +332,35 @@ def _configure_robot_spec(spec: mujoco.MjSpec) -> None:
         actuator.forcerange = (-effort, effort)
 
 
-def _load_robot_spec() -> mujoco.MjSpec:
-    # go2_pie.xml carries a meshdir="assets" placeholder and .obj mesh names;
-    # the real meshes are the shared decimated MSH set (robot-assets repo),
-    # spliced in here (path + extension).
-    xml = GO2_PIE_XML.read_text()
-    xml = xml.replace('meshdir="assets"', f'meshdir="{_go2_meshdir()}"')
-    xml = re.sub(r'file="([a-z_0-9]+)\.obj"', r'file="\1.msh"', xml)
+def _load_robot_spec(robot: Robot) -> mujoco.MjSpec:
+    # The MJCFs carry a meshdir="assets" placeholder; the real meshes are the
+    # shared decimated MSH set (model/ bundle), spliced in here. go2_pie.xml
+    # also names .obj files (path + extension).
+    if robot.pie_plant:
+        xml = GO2_PIE_XML.read_text()
+        xml = re.sub(r'file="([a-z_0-9]+)\.obj"', r'file="\1.msh"', xml)
+    else:
+        xml = robot.mjcf.read_text()
+    xml = xml.replace('meshdir="assets"', f'meshdir="{_meshdir(robot)}"')
     spec = mujoco.MjSpec.from_string(xml)
-    _configure_robot_spec(spec)
+    if robot.pie_plant:
+        _configure_robot_spec(spec)
     return spec
 
 
-def _add_depth_camera_and_shell(base) -> None:
+def _add_depth_camera_and_shell(base, robot: Robot) -> None:
     base.add_camera(
         name=DEPTH_CAMERA_NAME,
-        pos=C.DEPTH_CAMERA_POS,
-        quat=C.DEPTH_CAMERA_QUAT,
+        pos=robot.camera_pos,
+        quat=robot.camera_quat,
         fovy=C.DEPTH_FOVY_DEG,
     )
     # Camera shell visual, same dims/pose as PIE sim2sim (contype 0).
     base.add_geom(
         name="front_depth_camera_visual",
         type=mujoco.mjtGeom.mjGEOM_BOX,
-        pos=(0.332784, 0.0, 0.074446),
-        quat=C.DEPTH_CAMERA_QUAT,
+        pos=np.add(robot.camera_pos, SHELL_FROM_DEPTH_CAMERA),
+        quat=robot.camera_quat,
         size=(0.045, 0.018, 0.012),
         rgba=(0.0, 0.0, 0.0, 1.0),
         contype=0,
@@ -400,17 +404,29 @@ def _apply_plant_options(spec: mujoco.MjSpec) -> None:
     spec.option.ccd_iterations = 500
 
 
-def _bindings(model: mujoco.MjModel, shell_id: int) -> Bindings:
+def _joint_names(model: mujoco.MjModel, robot: Robot) -> tuple[str, ...]:
+    """PIE's actuated order for go2; model order (= the training joint
+    order) for the training MJCFs, every hinge joint actuated."""
+    if robot.pie_plant:
+        return C.ACTUATED_JOINT_NAMES
+    return tuple(
+        mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, j)
+        for j in range(model.njnt)
+        if model.jnt_type[j] == mujoco.mjtJoint.mjJNT_HINGE)
+
+
+def _bindings(model: mujoco.MjModel, shell_id: int, robot: Robot) -> Bindings:
     def id_of(obj_type, name):
         i = mujoco.mj_name2id(model, obj_type, name)
         if i < 0:
             raise ValueError(f"model is missing {obj_type.name} {name!r}")
         return int(i)
 
-    joint_qpos_adr = np.empty(C.NUM_ACTIONS, dtype=np.int32)
-    joint_dof_adr = np.empty(C.NUM_ACTIONS, dtype=np.int32)
-    actuator_ids = np.empty(C.NUM_ACTIONS, dtype=np.int32)
-    for index, name in enumerate(C.ACTUATED_JOINT_NAMES):
+    joint_names = _joint_names(model, robot)
+    joint_qpos_adr = np.empty(len(joint_names), dtype=np.int32)
+    joint_dof_adr = np.empty(len(joint_names), dtype=np.int32)
+    actuator_ids = np.empty(len(joint_names), dtype=np.int32)
+    for index, name in enumerate(joint_names):
         jid = id_of(mujoco.mjtObj.mjOBJ_JOINT, name)
         aid = id_of(mujoco.mjtObj.mjOBJ_ACTUATOR, name)
         if int(model.actuator_trnid[aid, 0]) != jid:
@@ -425,6 +441,12 @@ def _bindings(model: mujoco.MjModel, shell_id: int) -> Bindings:
     acc_id = id_of(mujoco.mjtObj.mjOBJ_SENSOR, "imu_lin_acc")
     if int(model.sensor_dim[acc_id]) != 3:
         raise ValueError("imu_lin_acc sensor must be 3-dim")
+    default_joint_pos = (np.asarray(C.DEFAULT_JOINT_POS, np.float64)
+                         if robot.pie_plant
+                         else robot.default_joint_pos(joint_names))
+    # Velocity actuators (wheels: gain kv, no position bias) stand at 0.
+    position = model.actuator_biasprm[actuator_ids, 1] != 0.0
+    ctrl_default = np.where(position, default_joint_pos, 0.0)
     return Bindings(
         root_qpos_adr=int(
             model.jnt_qposadr[id_of(mujoco.mjtObj.mjOBJ_JOINT, "floating_base_joint")]
@@ -440,10 +462,28 @@ def _bindings(model: mujoco.MjModel, shell_id: int) -> Bindings:
             mujoco.mjtObj.mjOBJ_CAMERA, CONTRACT_DEPTH_CAMERA),
         contract_right_camera_id=id_of(
             mujoco.mjtObj.mjOBJ_CAMERA, CONTRACT_RIGHT_CAMERA),
+        robot=robot,
+        joint_names=joint_names,
+        default_joint_pos=default_joint_pos,
+        ctrl_default=ctrl_default,
     )
 
 
 def _validate(model: mujoco.MjModel, b: Bindings) -> None:
+    if not np.isclose(float(model.cam_fovy[b.depth_camera_id]), C.DEPTH_FOVY_DEG,
+                      atol=1e-10):
+        raise ValueError("depth camera fovy drifted from contract")
+    if float(model.opt.timestep) != C.PHYSICS_DT:
+        raise ValueError("scene option timestep is not PIE's 0.005")
+    if int(model.opt.integrator) != int(mujoco.mjtIntegrator.mjINT_IMPLICITFAST):
+        raise ValueError("scene option integrator is not ImplicitFast")
+    if not b.robot.pie_plant:
+        # Training MJCF: its own actuators, one per hinge joint.
+        n = len(b.joint_names)
+        if (model.nq, model.nv, model.nu) != (7 + n, 6 + n, n):
+            raise ValueError(f"{b.robot.name}: nq/nv/nu="
+                             f"{(model.nq, model.nv, model.nu)} for {n} joints")
+        return
     expected = (7 + C.NUM_ACTIONS, 6 + C.NUM_ACTIONS, C.NUM_ACTIONS)
     if (model.nq, model.nv, model.nu) != expected:
         raise ValueError(f"nq/nv/nu={(model.nq, model.nv, model.nu)}, want {expected}")
@@ -457,21 +497,9 @@ def _validate(model: mujoco.MjModel, b: Bindings) -> None:
     )
     if not all(checks):
         raise ValueError("compiled actuator contract does not match PIE")
-    if not np.isclose(float(model.cam_fovy[b.depth_camera_id]), C.DEPTH_FOVY_DEG,
-                      atol=1e-10):
-        raise ValueError("depth camera fovy drifted from contract")
-    from hil import CONTRACT_FOVY_DEG
-    for cid in (b.contract_left_camera_id, b.contract_right_camera_id):
-        if not np.isclose(float(model.cam_fovy[cid]), CONTRACT_FOVY_DEG,
-                          atol=1e-10):
-            raise ValueError("contract stereo camera fovy drifted")
-    if float(model.opt.timestep) != C.PHYSICS_DT:
-        raise ValueError("scene option timestep is not PIE's 0.005")
-    if int(model.opt.integrator) != int(mujoco.mjtIntegrator.mjINT_IMPLICITFAST):
-        raise ValueError("scene option integrator is not ImplicitFast")
 
 
-def _compile(scene_spec: mujoco.MjSpec, with_shell: bool):
+def _compile(scene_spec: mujoco.MjSpec, with_shell: bool, robot: Robot):
     shell = None
     if with_shell:
         for geom in scene_spec.geoms:
@@ -489,26 +517,26 @@ def _compile(scene_spec: mujoco.MjSpec, with_shell: bool):
         model,
         mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "front_depth_camera_visual")
         if with_shell else -1,
+        robot,
     )
     _validate(model, b)
     return model, b
 
 
-def build_model(scene_name: str = "map3", params: Any | None = None
-                ) -> tuple[mujoco.MjModel, Bindings]:
-    """Scene <name> + training go2 + PIE profile -> (model, bindings).
-
-    Sets the active scene/spawns/boxes for reset_to_spawn's z-snapping.
-    `params` is only meaningful for procedural scenes (floorplan); it
-    defaults to the scene's registered params.
-    """
+def build_model(scene_name: str = "map3",
+                robot: str = DEFAULT_ROBOT,
+                params: Any | None = None) -> tuple[mujoco.MjModel, Bindings]:
+    """Scene <name> + robot <robot> (sim/robots.py; go2 = training go2 +
+    PIE profile) -> (model, bindings). Sets the active scene for
+    reset_to_spawn's z-snapping. `params` is only meaningful for procedural
+    scenes (floorplan); it defaults to the scene's registered params."""
     global _ACTIVE, _ACTIVE_BOXES, _ACTIVE_SPAWNS, _ACTIVE_PARAMS
+    rb = get_robot(robot)
     sc = get_scene(scene_name)
     _ACTIVE = sc
     _ACTIVE_BOXES = None
     _ACTIVE_SPAWNS = sc.spawns
     _ACTIVE_PARAMS = None
-
     if sc.builder is not None:
         p = params if params is not None else sc.params
         scene = sc.builder(p)
@@ -519,36 +547,36 @@ def build_model(scene_name: str = "map3", params: Any | None = None
         attach_pos, attach_yaw = _ACTIVE_SPAWNS[sc.default_spawn]
         attach_pos = tuple(attach_pos)
     elif sc.xml is None:
-        return build_flat_model()
+        return build_flat_model(robot)
     else:
         scene = mujoco.MjSpec.from_file(
             str(_preprocess_scene(sc.xml, ASSETS / ".compose"))
         )
         attach_pos, attach_yaw = SPAWN_XYZ, SPAWN_YAW_DEG
-
     # Training terrain friction on the whole map (boxes + catch floor).
     for geom in scene.geoms:
         geom.friction[:] = TERRAIN_FRICTION
 
-    robot = _load_robot_spec()
+    robot_spec = _load_robot_spec(rb)
     yaw = np.radians(attach_yaw)
     frame = scene.worldbody.add_frame(
         pos=list(attach_pos), quat=[np.cos(yaw / 2), 0, 0, np.sin(yaw / 2)]
     )
-    base = next(b for b in robot.worldbody.bodies if b.name == "base_link")
+    base = next(b for b in robot_spec.worldbody.bodies if b.name == "base_link")
     frame.attach_body(base, "")
     base_in_scene = next(b for b in scene.worldbody.bodies if b.name == "base_link")
 
-    _add_depth_camera_and_shell(base_in_scene)
+    _add_depth_camera_and_shell(base_in_scene, rb)
+    rig = np.add(rb.camera_pos, RIG_FROM_DEPTH_CAMERA)
     for name, y in RIG_Y.items():
         cam = base_in_scene.add_camera(
-            name=name, pos=[RIG_POS[0], y, RIG_POS[2]], quat=RIG_QUAT_WXYZ
+            name=name, pos=[rig[0], y, rig[2]], quat=RIG_QUAT_WXYZ
         )
         cam.fovy = RIG_FOVY
     _add_contract_cameras(base_in_scene)
     _apply_plant_options(scene)
 
-    model, b = _compile(scene, with_shell=True)
+    model, b = _compile(scene, with_shell=True, robot=rb)
 
     # spawn sanity: front_depth looks along base +x, pitched down 20 deg.
     data = mujoco.MjData(model)
@@ -572,18 +600,19 @@ def build_model(scene_name: str = "map3", params: Any | None = None
     return model, b
 
 
-def build_map3_model() -> tuple[mujoco.MjModel, Bindings]:
+def build_map3_model(robot: str = DEFAULT_ROBOT) -> tuple[mujoco.MjModel, Bindings]:
     """Back-compat alias: build_model("map3")."""
-    return build_model("map3")
+    return build_model("map3", robot)
 
 
-def build_flat_model() -> tuple[mujoco.MjModel, Bindings]:
-    """Ground plane + training go2 (upstream sim2sim 'flat' analogue)."""
+def build_flat_model(robot: str = DEFAULT_ROBOT) -> tuple[mujoco.MjModel, Bindings]:
+    """Ground plane + robot (upstream sim2sim 'flat' analogue)."""
     global _ACTIVE, _ACTIVE_BOXES, _ACTIVE_SPAWNS, _ACTIVE_PARAMS
     _ACTIVE = SCENES["flat"]
     _ACTIVE_BOXES = None
     _ACTIVE_SPAWNS = _ACTIVE.spawns
     _ACTIVE_PARAMS = None
+    rb = get_robot(robot)
     scene = mujoco.MjSpec.from_string(
         "<mujoco model='pie_flat_smoke'>"
         "<worldbody>"
@@ -595,15 +624,15 @@ def build_flat_model() -> tuple[mujoco.MjModel, Bindings]:
         name="sun", pos=(0.0, 0.0, 5.0), dir=(0.0, 0.0, -1.0),
         type=mujoco.mjtLightType.mjLIGHT_DIRECTIONAL, castshadow=False,
     )
-    robot = _load_robot_spec()
+    robot_spec = _load_robot_spec(rb)
     frame = scene.worldbody.add_frame(pos=(0.0, 0.0, 0.0))
-    base = next(b for b in robot.worldbody.bodies if b.name == "base_link")
+    base = next(b for b in robot_spec.worldbody.bodies if b.name == "base_link")
     frame.attach_body(base, "")
     base_in_scene = next(b for b in scene.worldbody.bodies if b.name == "base_link")
-    _add_depth_camera_and_shell(base_in_scene)
+    _add_depth_camera_and_shell(base_in_scene, rb)
     _add_contract_cameras(base_in_scene)
     _apply_plant_options(scene)
-    return _compile(scene, with_shell=True)
+    return _compile(scene, with_shell=True, robot=rb)
 
 
 def reset_to_spawn(model: mujoco.MjModel, data: mujoco.MjData, b: Bindings,
@@ -611,39 +640,41 @@ def reset_to_spawn(model: mujoco.MjModel, data: mujoco.MjData, b: Bindings,
                    yaw_deg: float | None = None) -> None:
     """Drop the dog at the scene spawn (map3), origin+0.32 (flat), or an
     explicit pos/yaw override (e.g. the R2b stairs-down start on
-    landing_F4_east at (-8.75, 5.7) facing -y = yaw 270)."""
+    landing_F4_east at (-8.75, 5.7) facing -y = yaw 270). Heights are
+    go2's; other robots stand their own spawn_drop above the ground."""
     mujoco.mj_resetData(model, data)
     root = b.root_qpos_adr
     if pos is None and _ACTIVE_BOXES is not None:
         # procedural scenes resolve their default spawn from the params
         pos, yaw_deg = _ACTIVE_SPAWNS[_ACTIVE.default_spawn]
+    drop = b.robot.spawn_drop
     if pos is not None:
         sc = _ACTIVE
         if _ACTIVE_BOXES is not None:
             z = ground_top_at(_ACTIVE_BOXES, *pos[:2], pos[2]) + SPAWN_DROP
         elif sc.collision is not None:
             boxes = load_boxes(str(sc.collision))
-            z = ground_top_at(boxes, *pos[:2], pos[2]) + SPAWN_DROP
+            z = ground_top_at(boxes, *pos[:2], pos[2]) + drop
         else:
             # scenes without a collision fragment: the hint IS a validated
-            # standing pose (e.g. map2's gsplat initial_qpos)
-            z = pos[2]
+            # standing pose (e.g. map2's gsplat initial_qpos) for go2
+            z = pos[2] + drop - SPAWN_DROP
         yaw = np.radians(yaw_deg if yaw_deg is not None else 0.0)
         data.qpos[root:root + 3] = (pos[0], pos[1], z)
     elif model.ngeom > 100:  # map3: 123 collision boxes + floor -> find slab top
         boxes = load_boxes(str(SCENES["map3"].collision))
-        z = ground_top_at(boxes, *SPAWN_XYZ[:2], SPAWN_XYZ[2]) + SPAWN_DROP
+        z = ground_top_at(boxes, *SPAWN_XYZ[:2], SPAWN_XYZ[2]) + drop
         yaw = np.radians(SPAWN_YAW_DEG)
         data.qpos[root:root + 3] = (SPAWN_XYZ[0], SPAWN_XYZ[1], z)
     else:
-        z, yaw = 0.32, 0.0
+        z, yaw = 0.32 + drop - SPAWN_DROP, 0.0
         data.qpos[root:root + 3] = (0.0, 0.0, z)
     if pos is None and yaw_deg is not None:
         yaw = np.radians(yaw_deg)
     data.qpos[root + 3:root + 7] = (np.cos(yaw / 2), 0, 0, np.sin(yaw / 2))
-    data.qpos[b.joint_qpos_adr] = C.DEFAULT_JOINT_POS
+    data.qpos[b.joint_qpos_adr] = b.default_joint_pos
     data.qvel[:] = 0.0
-    data.ctrl[b.actuator_ids] = C.DEFAULT_JOINT_POS
+    data.ctrl[b.actuator_ids] = b.ctrl_default
     if settle:
         for _ in range(SETTLE_STEPS):
             mujoco.mj_step(model, data)
@@ -653,11 +684,13 @@ def reset_to_spawn(model: mujoco.MjModel, data: mujoco.MjData, b: Bindings,
 
 
 def main() -> int:
-    for name, fn in (("flat", build_flat_model),
-                     ("map3", build_map3_model),
-                     ("floorplan", lambda: build_model("floorplan"))):
+    robot = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_ROBOT
+    builds = (("flat", lambda: build_flat_model(robot)),
+              ("map3", lambda: build_map3_model(robot)),
+              ("floorplan", lambda: build_model("floorplan", robot)))
+    for name, fn in builds:
         model, b = fn()
-        print(f"[{name}] nq/nv/nu={model.nq}/{model.nv}/{model.nu} "
+        print(f"[{robot} {name}] nq/nv/nu={model.nq}/{model.nv}/{model.nu} "
               f"dt={model.opt.timestep} integ={model.opt.integrator} "
               f"cam_fovy={model.cam_fovy[b.depth_camera_id]:.4f} "
               f"geoms={model.ngeom} timestep_ok=True")

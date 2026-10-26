@@ -32,6 +32,7 @@ release-flush-to-idle path.
 
     Up      vx = +VX_HOLD (0.5)     Down    vx = -VX_HOLD_BWD (0.2)
     Left    wz = +WZ_HOLD (0.3)     Right   wz = -WZ_HOLD
+    ,       vy = +VY_HOLD (0.3)     .       vy = -VY_HOLD   (strafe left/right)
     Space   stop    R reset (viewer window / web GUI button)
 
 ConstantCmd: scripted (vx, wz) for headless smokes, optionally segmented.
@@ -48,13 +49,18 @@ VX_HOLD_BWD = 0.2  # teleop backward cap; training band (-0.25, -0.05),
                   # tracked at ~72% median by the flat specialist (10496)
 WZ_HOLD = 0.3    # teleop ANGULAR_VEL; user cap ~0.10 m/s at the nose
                  # (r~0.3 m) => wz <= 0.33; in-place band (0.10, 0.33)
+VY_HOLD = 0.3    # strafe; go2_depth_v2 trains |vy| <= 0.5
 CALLBACK_HOLD_S = 0.8   # callback press = hold this long (no reliable repeat)
 RELEASE_FLUSH_S = 1.0   # post-release zero-flush window (gazebo RELEASE_FLUSH_S)
 
-_ARROW_ACTIONS = {265: "vx+", 264: "vx-", 263: "wz+", 262: "wz-"}
+_ARROW_ACTIONS = {265: "vx+", 264: "vx-", 263: "wz+", 262: "wz-",
+                  44: "vy+", 46: "vy-"}
 
 # kernel input.h key codes -> the GLFW-ish codes used internally
-_KERNEL_TO_CODE = {103: 265, 108: 264, 105: 263, 106: 262}  # UP DOWN LEFT RIGHT
+_KERNEL_TO_CODE = {103: 265, 108: 264, 105: 263, 106: 262,  # UP DOWN LEFT RIGHT
+                   51: 44, 52: 46}                          # COMMA DOT
+# A device counts as a keyboard when it has the arrow keys.
+_KERNEL_ARROWS = (103, 108, 105, 106)
 
 
 def _ioc(dir_bits: int, type_: int, nr: int, size: int) -> int:
@@ -99,7 +105,7 @@ class InputPoll:
     def _has_arrows(self, fd: int) -> bool:
         caps = self._bits(fd, _EVIOCGBIT_KEY)
         return all(caps[k >> 3] & (1 << (k & 7))
-                   for k in _KERNEL_TO_CODE)
+                   for k in _KERNEL_ARROWS)
 
     def arrows(self) -> set:
         """Codes currently physically held, OR-ed across keyboards."""
@@ -146,7 +152,8 @@ class HoldCmd:
                     dpy = display.Display()
                     kc_map = {}
                     for name, code in (("Up", 265), ("Down", 264),
-                                       ("Left", 263), ("Right", 262)):
+                                       ("Left", 263), ("Right", 262),
+                                       ("comma", 44), ("period", 46)):
                         kc = dpy.keysym_to_keycode(XK.string_to_keysym(name))
                         if kc:
                             kc_map[int(kc)] = code
@@ -208,9 +215,11 @@ class HoldCmd:
         held = self._held_set()
         vx = (VX_HOLD if 265 in held else 0.0) - \
              (VX_HOLD_BWD if 264 in held else 0.0)
+        vy = (VY_HOLD if 44 in held else 0.0) - \
+             (VY_HOLD if 46 in held else 0.0)
         wz = (WZ_HOLD if 263 in held else 0.0) - \
              (WZ_HOLD if 262 in held else 0.0)
-        return np.asarray((vx, 0.0, wz), dtype=np.float32)
+        return np.asarray((vx, vy, wz), dtype=np.float32)
 
     def active(self) -> str:
         """Teleop lifecycle, gazebo teleop semantics: 'live' while an arrow
@@ -277,9 +286,10 @@ class ConstantCmd:
     """Scripted command source for headless runs."""
 
     def __init__(self, vx: float, wz: float = 0.0,
-                 segments: list | None = None) -> None:
-        self.vx, self.wz = vx, wz
-        self.segments = segments or []   # [(duration_s, vx, wz), ...]
+                 segments: list | None = None, vy: float = 0.0) -> None:
+        self.vx, self.vy, self.wz = vx, vy, wz
+        # [(duration_s, vx, wz), ...] or [(duration_s, vx, vy, wz), ...]
+        self.segments = segments or []
         self._t0 = None
 
     def vector(self) -> np.ndarray:
@@ -288,11 +298,12 @@ class ConstantCmd:
                 self._t0 = 0.0
             elapsed = self._t0
             self._t0 += 0.02
-            for dur, vx, wz in self.segments:
+            for dur, *cmd in self.segments:
                 if elapsed < dur:
-                    return np.asarray((vx, 0.0, wz), np.float32)
+                    vx, vy, wz = cmd if len(cmd) == 3 else (cmd[0], 0.0, cmd[1])
+                    return np.asarray((vx, vy, wz), np.float32)
                 elapsed -= dur
-        return np.asarray((self.vx, 0.0, self.wz), dtype=np.float32)
+        return np.asarray((self.vx, self.vy, self.wz), dtype=np.float32)
 
     def consume_reset(self) -> bool:
         return False

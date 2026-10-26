@@ -19,16 +19,25 @@ fovy is applied, so camera_info and the rendered pixels never drift.
 
 Usage:
     python hil.py 5070 [--scene map3|map2] [--spawn <scene's>]
+        [--robot go2|go2w|as2|...] [--gamepad]
         [--cam-hz 10] [--vio-hz 100]
         [--imu-every 1]
         [--preview [--p-host H --p-port N]] [--no-viewer]
         [--view web|glfw [--web-port 8012]]  (web default: headless viser
         viewer, ~0.04 core @10Hz vs ~0.69 for glfw; no DISPLAY needed)
 
-Commands: the stack's /cmd_vel drives; physically held arrow keys override
-it (release runs the gazebo 1s zero-flush, then DDS resumes). Reset/Stop
-are the web GUI buttons only -- no keyboard bindings for them, on purpose:
-a stray R press must not reset a live HIL session.
+Commands: the stack's /cmd_vel drives; a gamepad on this host overrides it
+while gamepad control is on (--gamepad, the web panel or A on the pad), and
+physically held arrow keys override both (release runs the gazebo 1s
+zero-flush, then the pad / DDS resumes). Reset/Stop are the web GUI buttons
+only -- no keyboard bindings for them, on purpose: a stray R press must not
+reset a live HIL session.
+
+--robot picks the body (sim/robots.py) at boot -- the face measures its
+camera mounts once, so the web panel shows the robot but cannot swap it
+(view.py can). The robot's registry perception policy drives it (--policy
+pins another ONNX); the panel's perception toggle swaps to the robot's
+blind policy when it has one.
 """
 from __future__ import annotations
 
@@ -63,8 +72,9 @@ from sim.plant import (  # noqa: E402
     get_scene,
     reset_to_spawn,
 )
-from sim.policy import PieOnnxPolicy, load_policy  # noqa: E402
-from sim.expert import DualExpertPolicy  # noqa: E402
+from sim.policy import PieOnnxPolicy  # noqa: E402
+from sim.gamepad import GamepadCmd, GamepadOverride  # noqa: E402
+from sim.robots import DEFAULT_ROBOT, ROBOTS, get_robot  # noqa: E402
 from sim.runtime import DepthCamera, PieRuntime  # noqa: E402
 from sim.keyboard import HoldCmd, KeyboardOverride  # noqa: E402
 
@@ -88,6 +98,11 @@ def _argv_value(flag: str, default):
     return sys.argv[sys.argv.index(flag) + 1] if flag in sys.argv else default
 
 
+def _pad_envelope(policy):
+    """Gamepad full deflection = the policy's training command envelope."""
+    return policy.contract.COMMAND_LOW, policy.contract.COMMAND_HIGH
+
+
 def main() -> int:
     argv = [a for a in sys.argv[1:] if not a.startswith("--")]
     sel = argv[0] if argv else "5070"
@@ -108,10 +123,8 @@ def main() -> int:
     view_mode = _argv_value("--view", "web")      # web | glfw
     web_port = int(_argv_value("--web-port", "8012"))
     wall_alpha = float(_argv_value("--wall-alpha", "0.1"))
-    expert_mode = _argv_value("--expert", "auto")   # auto | stairs | flat | single
     policy_path = _argv_value("--policy", None)
-    if expert_mode not in ("auto", "stairs", "flat", "single"):
-        raise SystemExit(f"unknown --expert {expert_mode!r}")
+    robot = get_robot(_argv_value("--robot", DEFAULT_ROBOT))
     if view_mode == "web":
         use_viewer = False    # web viewer replaces the GLFW window entirely
     p_host = _argv_value("--p-host", "127.0.0.1")
@@ -120,7 +133,7 @@ def main() -> int:
         raise SystemExit(f"unknown spawn {spawn!r}; choose {sorted(sc.spawns)}")
     pos, yaw_deg = sc.spawns[spawn]
 
-    model, b = build_model(scene_name)
+    model, b = build_model(scene_name, robot.name)
     model.vis.quality.shadowsize = 0
     data = mujoco.MjData(model)
     reset_to_spawn(model, data, b, settle=True, pos=pos, yaw_deg=yaw_deg)
@@ -223,17 +236,6 @@ def main() -> int:
                 p + np.array([-0.35, -1.6, 0.6]))
             web_server.initial_camera.look_at = tuple(p)
 
-            # Reset/Stop live ONLY here in hil (no keyboard bindings):
-            # the buttons set the flags the control loop consumes.
-            def _add_cmd_button(label: str, key: str) -> None:
-                btn = web_server.gui.add_button(label)
-
-                @btn.on_click
-                def _(_event) -> None:
-                    keys[key] = True
-
-            _add_cmd_button("Reset to spawn", "reset")
-            _add_cmd_button("Stop", "stop")
             web_scene.show_contact_points = True
             # hulls render at 0.5 opacity over EVERY geom (walls, dog) and
             # read as opaque -- collision viewing is covered by the G3 group
@@ -304,27 +306,35 @@ def main() -> int:
     from hil.ros import RosFace
     face = RosFace(sink, vio_hz, imu_every)
 
-    # command priority: physically held arrows override the stack's
-    # /cmd_vel (human nudge during e2e runs); release runs the gazebo
-    # 1s zero-flush, then the DDS source flows again.
+    # command priority: physically held arrows override the gamepad (while
+    # its control is on), which overrides the stack's /cmd_vel (human nudge
+    # during e2e runs); release runs the gazebo 1s zero-flush, then the
+    # lower source flows again.
     kb = HoldCmd()
-    cmd_mux = KeyboardOverride(kb, face.cmd)
+    pad = GamepadCmd(enabled="--gamepad" in sys.argv)
+    cmd_mux = KeyboardOverride(kb, GamepadOverride(pad, face.cmd))
 
-    # Dual experts on stairs scenes (sim/expert.py): the scene's own veteran
-    # for forward/side commands, the flat omni net for backward. On the flat
-    # scene the primary IS the omni net -- a dual pair of the same file would
-    # only reset its GRU on every direction flip.
-    _flat = "policy_24000_flat_omni.onnx"
     _primary = (Path(policy_path) if policy_path
-                else _HERE / "assets" / "policy" / sc.hil_policy)
-    policy = load_policy(_primary, provider="cpu")
-    if (isinstance(policy, PieOnnxPolicy) and expert_mode != "single"
-            and sc.hil_policy != _flat):
-        policy = DualExpertPolicy(_primary, _HERE / "assets" / "policy" / _flat,
-                                  mode=expert_mode, provider="cpu")
+                else robot.policy_path("perception"))
+    policy = PieOnnxPolicy(_primary, provider="cpu")
     rt = PieRuntime(model, b, data, policy, policy_cam, cmd_mux,
                     spawn_pos=pos, spawn_yaw_deg=yaw_deg,
                     substep_hook=sink.sample)
+    pad.set_envelope(*_pad_envelope(policy))
+    print(f"robot={robot.name} policy={_primary.name} "
+          f"contract={policy.contract.name}", flush=True)
+
+    # operator panel (webpanel.py): follow camera, policy depth inset,
+    # gamepad/perception toggles and the Reset/Stop buttons -- the latter
+    # live ONLY here in hil (no keyboard bindings): they set the flags the
+    # control loop consumes.
+    panel = None
+    if web_scene is not None:
+        from webpanel import OperatorPanel
+        panel = OperatorPanel(web_server, ROBOTS, robot.name, gamepad=pad,
+                              on_button=lambda name: keys.__setitem__(name, True),
+                              robot_select=False)
+        panel.show_robot(robot.name, True, True, robot.has_policy("blind"))
 
     srv = None
     if preview:
@@ -481,11 +491,25 @@ def main() -> int:
                 keys["stop"] = False
                 cmd_mux.zero()
                 print("[STOP] command zeroed (GUI Stop)", flush=True)
+            request = panel.take_request() if panel is not None else None
+            if request is not None and request[0] == "perception":
+                kind = "perception" if request[1] else "blind"
+                try:
+                    path = (_primary if kind == "perception"
+                            else robot.policy_path("blind"))
+                    policy = PieOnnxPolicy(path, provider="cpu")
+                    rt = PieRuntime(model, b, data, policy, policy_cam, cmd_mux,
+                                    spawn_pos=pos, spawn_yaw_deg=yaw_deg,
+                                    substep_hook=sink.sample)
+                    pad.set_envelope(*_pad_envelope(policy))
+                    print(f"[SWITCH] {kind} policy={path.name}", flush=True)
+                except Exception as exc:      # noqa: BLE001
+                    print(f"[SWITCH] {kind} refused: {exc}", flush=True)
+                    kind = "perception"
+                panel.show_robot(robot.name, kind == "perception", True,
+                                 robot.has_policy("blind"))
             now = time.perf_counter()
             if now >= next_ctrl:
-                sel = getattr(policy, "select", None)
-                if sel is not None:
-                    sel(float(cmd_mux.vector()[0]))
                 rt.tick()
                 next_ctrl = max(next_ctrl + CONTROL_DT, time.perf_counter())
                 # pose snapshot for the render thread: THE stamp = pose
@@ -514,6 +538,16 @@ def main() -> int:
             # the scene-repaint cost.
             if web_scene is not None and now2 - t_view >= 1 / view_hz:
                 web_scene.update_from_mjdata(data)
+                if panel is not None:
+                    pad_txt = (("on " if pad.enabled else "off ") + pad.name
+                               if pad.connected else "no pad")
+                    panel.update(
+                        rt.base_pos(), data.qpos[root + 3:root + 7],
+                        rt.depth_frame(),
+                        f"{robot.label} · {policy.contract.name} · "
+                        f"cmd {rt.command[0]:+.2f} "
+                        f"{rt.command[1]:+.2f} {rt.command[2]:+.2f} "
+                        f"({cmd_mux.state}) · gamepad {pad_txt}")
                 t_view = now2
             elif viewer is not None and now2 - t_view >= 1 / view_hz:
                 viewer.sync()

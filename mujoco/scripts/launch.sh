@@ -24,6 +24,7 @@
 #   --venv DIR      python venv              (default: probed, see below)
 #   sim: --view web|glfw  --web-port N  --preview [--p-host --p-port]
 #        (--view web is the entrypoint default; glfw needs X)
+#   sim/hil: --robot NAME (sim/robots.py)  --gamepad  [sim: --blind]
 #
 # venv probe order: $MJSIM_VENV, $ROOT/.venv*, sibling splatsense venvs
 #   (../splatsense/.venv-wgpu on the work station, ../splatsense/.venv312 on
@@ -51,6 +52,9 @@ while [ $# -gt 0 ]; do
     --cam-hz|--vio-hz|--imu-every)
       HIL_EXTRA="$HIL_EXTRA $1 $2"; shift ;;
     --preview) SIM_EXTRA="$SIM_EXTRA --preview"; HIL_EXTRA="$HIL_EXTRA --preview" ;;
+    --robot) SIM_EXTRA="$SIM_EXTRA --robot $2"; HIL_EXTRA="$HIL_EXTRA --robot $2"; shift ;;
+    --gamepad) SIM_EXTRA="$SIM_EXTRA --gamepad"; HIL_EXTRA="$HIL_EXTRA --gamepad" ;;
+    --blind) SIM_EXTRA="$SIM_EXTRA --blind" ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
   shift

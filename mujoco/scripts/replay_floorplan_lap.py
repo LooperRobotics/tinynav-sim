@@ -22,7 +22,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import sim.plant as _plant  # noqa: E402
 from sim.plant import build_model, get_scene, reset_to_spawn  # noqa: E402
 from sim.runtime import DepthCamera, PieRuntime  # noqa: E402
-from sim.policy import load_policy  # noqa: E402
+from sim.policy import PieOnnxPolicy  # noqa: E402
+from sim.robots import get_robot  # noqa: E402
 
 _HERE = Path(_plant.__file__).resolve().parents[1]
 W, H = 854, 480
@@ -84,9 +85,8 @@ def main() -> None:
     data = mujoco.MjData(model)
     reset_to_spawn(model, data, b, settle=True,
                    pos=(-2.5, 0.0, 0.30), yaw_deg=90.0)
-    policy = load_policy(
-        _HERE / "assets" / "policy" / get_scene("floorplan").hil_policy,
-        provider="cpu")
+    policy = PieOnnxPolicy(get_robot("go2").policy_path("blind"),
+                           provider="cpu")
     depth_cam = DepthCamera(model, b.depth_camera_id)
     cmd = PlaybackSource(rows)
     rt = PieRuntime(model, b, data, policy, depth_cam, cmd,

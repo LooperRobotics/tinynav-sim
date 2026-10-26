@@ -1,5 +1,7 @@
 # go2 楼梯策略实验总结与待解决问题（map3 楼梯间）
 
+> **历史档案**：本文记录的 PIE 策略（policy.onnx = model_18997、policy_24000_flat_omni.onnx）与双专家选择器已于 2026-10 从 mujoco/ 移除，现役策略见 mujoco/README.md「机型、策略与网页操作面板」。
+
 覆盖从 v12 转弯优化到 map3 楼梯间训练、部署、实测反馈的完整实验线。
 训练/验收协议（四层验收 + stage 门槛）见 `docs/stairs-map3-verification.md`。
 早期版本细节见 `stairs_exp/爬楼训练问题与尝试总结.md`（v1–v13 逐次记录）；
