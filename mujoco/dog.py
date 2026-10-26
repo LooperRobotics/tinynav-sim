@@ -99,6 +99,37 @@ class EmuStateRing:
         return vals[1], vals[2:5], vals[5:9], vals[9:12], vals[12:15]
 
 
+# Full-qpos side-channel for offboard video capture: the state ring carries
+# the base only (all the contract face needs), and a BEV video replayed from
+# those base poses would show the legs standing still.  Same single-writer
+# discipline, one record per control tick.
+QPOS_PATH = "/dev/shm/mjsim_emu_qpos.bin"
+QPOS_CAP = 64
+_QHDR = struct.Struct("<QdI")
+
+
+class QposTap:
+    def __init__(self, nq: int, path: str = QPOS_PATH) -> None:
+        import mmap
+        self._nq = min(int(nq), QPOS_CAP)
+        self._size = _QHDR.size + 8 * self._nq
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            os.ftruncate(fd, self._size)
+            self._buf = mmap.mmap(fd, self._size)
+        finally:
+            os.close(fd)
+        self._buf.seek(0)
+        self._buf.write(b"\0" * self._size)
+        self._seq = 0
+
+    def write(self, t: float, qpos) -> None:
+        self._seq += 1
+        self._buf.seek(0)
+        self._buf.write(_QHDR.pack(self._seq, t, self._nq))
+        self._buf.write(np.asarray(qpos[:self._nq], dtype=np.float64).tobytes())
+
+
 def _measure_camera_mounts(model, data, b) -> list[dict]:
     """Per-contract-camera rigid mount T_base_camera (raw mujoco camera
     frame, NOT optical -- contract_face.py applies optical() per publish,
@@ -129,16 +160,19 @@ def _measure_camera_mounts(model, data, b) -> list[dict]:
     return mounts
 
 
-def _spawn_contract_face(ply: Path, mounts, args) -> subprocess.Popen:
-    cmd = [sys.executable, "-u", str(_HERE / "contract_face.py"),
-           "--ply", str(ply),
-           "--mounts", json.dumps(mounts),
-           "--scene", args.scene,
-           "--cam-hz", str(args.cam_hz),
-           "--vio-hz", str(args.vio_hz),
-           "--imu-every", str(args.imu_every),
-           "--depth", args.depth,
-           "--gpu", args.gpu]
+def _spawn_contract_face(ply: Path | None, mounts, args) -> subprocess.Popen:
+    cmd = [sys.executable, "-u", str(_HERE / "contract_face.py")]
+    if ply is not None:
+        cmd += ["--ply", str(ply)]
+    cmd += ["--mounts", json.dumps(mounts),
+            "--scene", args.scene,
+            "--cam-hz", str(args.cam_hz),
+            "--vio-hz", str(args.vio_hz),
+            "--imu-every", str(args.imu_every),
+            "--depth", args.depth,
+            "--gpu", args.gpu]
+    if args.floorplan_config:
+        cmd += ["--floorplan-config", args.floorplan_config]
     return subprocess.Popen(cmd)
 
 
@@ -185,7 +219,10 @@ def main() -> int:
     ap.add_argument("--web-port", type=int, default=8013)
     ap.add_argument("--contract", action="store_true",
                     help="serve the looper perception face via "
-                         "contract_face.py (needs splat + GPU)")
+                         "contract_face.py (splat scenes need the ply; "
+                         "floorplan uses the native mujoco renderer)")
+    ap.add_argument("--floorplan-config", default=None,
+                    help="floorplan YAML (procedural floorplan scene)")
     ap.add_argument("--cam-hz", type=float, default=10.0)
     ap.add_argument("--vio-hz", type=float, default=100.0)
     ap.add_argument("--imu-every", type=int, default=1)
@@ -207,15 +244,16 @@ def main() -> int:
     args = ap.parse_args()
 
     import mujoco  # noqa: E402
-    from sim.plant import build_model, get_scene, reset_to_spawn
-    from sim.policy import PieOnnxPolicy
-    from sim.expert import DualExpertPolicy
-    from sim.runtime import DepthCamera, PieRuntime
+    from sim.plant import (active_spawns, build_model, get_scene,
+                           reset_to_spawn)  # noqa: E402
+    from sim.floorplan import load_params  # noqa: E402
+    from sim.policy import PieOnnxPolicy, load_policy  # noqa: E402
+    from sim.expert import DualExpertPolicy  # noqa: E402
+    from sim.runtime import DepthCamera, PieRuntime  # noqa: E402
 
     profile = get_profile(args.profile)
     sc = get_scene(args.scene)
     spawn = args.spawn or sc.default_spawn
-    pos, yaw_deg = sc.spawns[spawn]
 
     from unitree_sdk2py.core.channel import ChannelFactoryInitialize
     ChannelFactoryInitialize(0, args.iface)
@@ -227,7 +265,14 @@ def main() -> int:
     scenario_svc = ScenarioService(scenarios)
     sport = SportService(fsm, emu_cmd, scenarios)
 
-    model, b = build_model(args.scene)
+    model, b = build_model(
+        args.scene,
+        load_params(args.floorplan_config) if args.floorplan_config else None)
+    spawns = active_spawns()
+    if spawn not in spawns:
+        raise SystemExit(
+            f"unknown spawn {spawn!r}; choose {sorted(spawns)}")
+    pos, yaw_deg = spawns[spawn]
     # go2 body invariant: root free joint (6) + 12 leg dofs. The snapshot
     # builder reads qvel[0:3] as the root linear velocity; a joint-order
     # change would otherwise corrupt vel_body silently.
@@ -235,6 +280,7 @@ def main() -> int:
     model.vis.quality.shadowsize = 0
     data = mujoco.MjData(model)
     reset_to_spawn(model, data, b, settle=True, pos=pos, yaw_deg=yaw_deg)
+    qpos_tap = QposTap(model.nq)
 
     # Dual experts on stairs scenes (sim/expert.py): the scene's own veteran
     # for forward/side commands, the flat omni net for backward. On the flat
@@ -243,9 +289,9 @@ def main() -> int:
     _flat = "policy_24000_flat_omni.onnx"
     _primary = (Path(args.policy) if args.policy
                 else _HERE / "assets" / "policy" / sc.hil_policy)
-    if args.expert == "single" or sc.hil_policy == _flat:
-        policy = PieOnnxPolicy(_primary, provider="cpu")
-    else:
+    policy = load_policy(_primary, provider="cpu")
+    if (isinstance(policy, PieOnnxPolicy) and args.expert != "single"
+            and sc.hil_policy != _flat):
         policy = DualExpertPolicy(_primary, _HERE / "assets" / "policy" / _flat,
                                   mode=args.expert, provider="cpu")
     policy_cam = DepthCamera(model, b.depth_camera_id)
@@ -298,14 +344,16 @@ def main() -> int:
 
     face_proc = None
     if args.contract:
-        if not sc.ply:
+        if not sc.ply and sc.render != "mujoco":
             raise SystemExit(
-                f"scene {args.scene!r} has no splat ply -- contract face "
-                "needs map3|map2")
+                f"scene {args.scene!r} has no splat ply -- the contract face "
+                "needs a splat scene (map3|map2) or a native-render scene "
+                "(floorplan)")
         mounts = _measure_camera_mounts(model, data, b)
         ring = EmuStateRing()
-        face_proc = _spawn_contract_face(
-            Path(_HERE.parent / "model" / "splat" / sc.ply), mounts, args)
+        ply = (Path(_HERE.parent / "model" / "splat" / sc.ply)
+               if sc.ply else None)
+        face_proc = _spawn_contract_face(ply, mounts, args)
 
         def _substep_hook(mjdata) -> None:
             """Per-substep: feed the contract face's ring (imu cadence)."""
@@ -371,6 +419,7 @@ def main() -> int:
                     sel(float(cmd_source.vector()[0]))
                 rt.tick()
                 next_ctrl = max(next_ctrl + CONTROL_DT, time.perf_counter())
+                qpos_tap.write(time.time(), data.qpos)
                 root = b.root_qpos_adr
                 quat = tuple(data.qpos[root + 3:root + 7])
                 rot = _quat_wxyz_to_mat(quat)
