@@ -38,10 +38,19 @@ mujoco/
 │                        ../docs/stairs-map3-experiments.md）
 │                        + policy_24000_flat_omni.onnx（平地全向专家，
 │                        view.py 双专家 auto 的后退分支，见同文）
+│                        + go2_pie_blind_flat.onnx（本仓 mjlab 训的盲走
+│                        速度策略，floorplan 现役，见 train/README.md）
+│                        + go2_rl_gym_moe_*.onnx（外部盲走探针，不迁移）
 │                        + policy.sha256（训练侧校验清单）
 └── scripts/
     ├── launch.sh        统一 tmux 启动器（sim | mj | hil）
-    └── probe_viewer.py  X/GLFW 健康探测
+    ├── probe_viewer.py  X/GLFW 健康探测
+    ├── render_floorplan_bev.py       静态 BEV 复核图（含任务点/环向）
+    ├── render_floorplan_lap_video.py 进程内策略驱动的一圈视频（无 DDS）
+    ├── record_live_bev_qpos.py       直播一圈视频：读 qpos 通道 + goal/DWA 轨迹标记
+    ├── record_live_bev.py            直播一圈视频（仅 base，腿不摆）
+    ├── replay_floorplan_lap.py       开环回放录制的 /cmd_vel（会漂移，仅参考）
+    └── gen_floorplan_bag.py          合成走一圈的 rosbag2（建图用）
 ```
 
 资产来源：**不入 git 的大资产统一走 `model/` 资产包**——把 `model.zip`
@@ -88,7 +97,7 @@ emu 的工具链（全部入库，可重放）：
 - **探针**：`python3 -m robot_emu.probe_as2|probe_go2 --iface docker0`——真 SDK 客户端核对线面事实 + FSM 门控序列，退出码即结论。
 - **e2e**：emu 侧跑 `dog.py` 后，pilot 侧容器里 `ROBOT_TYPE=as2 python3 -m robot_emu.e2e_driver`（生产 unitree_control 全链路：拒动→stand→走一米→sit，含 /unitree/odometry 断言）与 `python3 -m robot_emu.e2e_charge`（charge_watch 充放电判定）。
 - **场景注入**：JSON 发 `rt/emu/scenario`：`{"bms_ma":1500,"bms_soc":95}`（在桩充电）、`{"error_code":N}`、`{"refuse_move":true}`（障碍拒动，Move 回 -1 且机体停）、`{"cmd_blackout_s":2}`（断流 N 秒）、`{"reset":true}`（回出生点）、`{"clear":true}`。
-- **默认场景 flat**（纯平地无坠落面，长跑测试用）；`--scene map2|map3` 复用 hil 场景。
+- **默认场景 flat**（纯平地无坠落面，长跑测试用）；`--scene map2|map3` 复用 hil 场景，`--scene floorplan --contract` 是平地 planning 测试（见下文）。
 
 dog/emu 的 DDS 依赖 unitree_sdk2py（纯 python；镜像 pip 安装 `mujoco/robot_emu/vendor/unitree_sdk2py` 里的 pin 源码检出——上游 `unitree_sdk2_python@814556d`，与 pilot 的 pyproject pin 同一 commit，子模块语义、提交时转正；树内直跑 DDS 模块前需先 `pip install` 该检出，L0 逻辑测试免安装）+ cyclonedds python 绑定。**版本必须 ≤0.10.x**：本机实测 cyclonedds 11 的 type object 会让 pilot 侧 0.10.2 解析段错误；mjsim (py3.12) 用 `CYCLONEDDS_HOME=<symlink farm→/opt/ros/jazzy>` 源码编 0.10.2 即可（其 libddsc 依赖 libiceoryx，也要链进 farm；Dockerfile 已把整套烤入）。**loopback 不能跑发现**（lo 无 IFF_MULTICAST，SDK 模板又没有 Peers 段）：bench 绑 `docker0`（有 MULTICAST flag、与真狗 123 网段隔离）。pilot 侧 ROS 2 与 SDK DDS 同域 0 并存无冲突；要严格隔离可在 bench 启动脚手架设 ROS_DOMAIN_ID（可选）。
 
@@ -101,14 +110,149 @@ OpenCV/Qt 窗口形态已废除（混合图形机器上 Qt 是四客户端
 段错误的成员之一；详细档案不入库，本机存于
 `~/workspace/dm/archive/gausscam-archive/p2-wgpu-report.md` §7/§8）。
 
-场景：`plant.SCENES` 注册表，hil/sim/mj 都吃 `--scene map3|map2`（默认
-map3）。**map3** = 楼梯井（123 box 精确碰撞，出生 F1 正对 L0 梯段，hil 载
-楼梯专家 18997）。**map2** = MetaCam map_2 室内（spirula 50k，2.98M 高斯；
-平地 box + 边界墙碰撞，出生 `low` = gsplat 验证过的低采段点 (3.21,−5.54)，
-yaw −11.5°——狗眼 0.45m 只有低采段渲染干净，**换出生点先 `--preview` 渲两
-帧对质再走**；hil 载平地专家 24000，sim 双专家 auto 不变）。碰撞地面高
-度在 `map2_scene.xml` + 注册表各有一处，改要一起改；新场景 = 一份 mjcf +
-注册表一个条目。
+场景：`plant.SCENES` 注册表，hil/sim/mj/dog 都吃
+`--scene map3|map2|floorplan`（默认 map3）。**map3** = 楼梯井（123 box
+精确碰撞，出生 F1 正对 L0 梯段，hil 载楼梯专家 18997）。**map2** = MetaCam
+map_2 室内（spirula 50k，2.98M 高斯；平地 box + 边界墙碰撞，出生 `low` =
+gsplat 验证过的低采段点 (3.21,−5.54)，yaw −11.5°——狗眼 0.45m 只有低采段
+渲染干净，**换出生点先 `--preview` 渲两帧对质再走**；hil 载平地专家 24000，
+sim 双专家 auto 不变）。碰撞地面高度在 `map2_scene.xml` + 注册表各有一处，
+改要一起改；新场景 = 一份 mjcf + 注册表一个条目。
+
+## floorplan：平地 planning 测试场景
+
+`--scene floorplan` 是**纯平地**的参数化楼梯平面（不爬楼、相机不拍楼梯），
+只用来测 planning/任务循环：
+
+```
+┌──────────────────────────────────────────┐  外墙
+│  ┌────────────────────────────────────┐  │
+│  │                                    │  │
+│  │            天井 (well)             │  │  内天井墙
+│  │                                    │  │
+│  └────────────────────────────────────┘  │
+│   platform W                 platform E  │  ← 四个任务点（两平台各两个）
+└──────────────────────────────────────────┘
+       flight N / flight S（长边，两段“楼梯”）
+```
+
+- 参数：`flight_len`（天井 x 长度/长边走廊）、`flight_width`（环形走廊宽）、
+  `well_width`（天井 y 宽）、`platform_len`（短边平台深）、`platform_width`
+  （= `2*flight_width+well_width`，校验）、墙高/墙厚/checker。默认在
+  `assets/floorplan/default.yaml`，`--floorplan-config` 覆盖。
+- 任务点四个，全在平台上：各在**楼梯中线 × 平台中线**交点（即环形路径四角）
+  `WN / EN / ES / WS`。顺时针（CW）= 下楼：`WN → EN → ES → WS`；逆时针
+  （CCW）= 上楼：`WN → WS → ES → EN`。相邻点连线就是走廊/平台中线，一圈
+  四条直边，无路由 via（早期 W/E 两点方案曾需要 N/S 航段中点做 via，
+  纯两点交替会被规划器走成同侧往返）。出生点仍是 W 平台中心（-x 侧）。
+- 墙面纹理：8 段墙各一张独有程序化纹理（`sim/floorplan_textures.py`，
+  色相 + 大字标 + 狗眼高度走廊码重复字带 + 种子点阵/条纹），地板按四区域
+  分色分尺度——这些是给 reloc 消视觉混叠的：只做“每面墙不同”时南北楼梯
+  会互为假回环，建图位姿图把半圈折叠（实测复现并修复）。原整块 checker
+  地板下移 5 mm 保留作接缝垫层（分块地板的缝会夹狗脚）。
+- 传感器：这个场景 `render="mujoco"`，左右目 RGB 和左目 depth 由
+  `sim/render_contract.py` 的 MuJoCo 原生 Renderer 出（契约 544×640、
+  fovy 93.168°、9.96 cm 基线、uint16 mm 深度），不需要 splat/PLY；VIO/IMU
+  仍是 MuJoCo 真值。它只在 **pilot emu 形态**里提供（`hil.py` 明确拒绝该
+  场景，见下）。
+
+运行（pilot emu 形态，`/opt/ros/jazzy` 由镜像 entrypoint 已 source）：
+
+```bash
+bash docker/run-mujoco-sim.sh dog -- --profile go2 --scene floorplan \
+    --contract --view web --iface <nic>
+# emu 的契约面: contract_face.py --scene floorplan --render auto（无需 --ply）
+```
+
+任务循环（与 nav 栈同 DDS 域；`--dry-run` 先看序列）：
+
+```bash
+python3 tools/probes/nav_cycle.py --dry-run
+python3 tools/probes/nav_cycle.py --mode alternate --cycles 2
+# down = 只顺时针下楼；up = 只逆时针上楼；alternate = 下楼/上楼各一圈
+```
+
+BEV 复核（新增/改参数后先渲图对质，再上栈）：
+
+```bash
+cd mujoco && python3 scripts/render_floorplan_bev.py \
+    --out ../fixtures/floorplan/floorplan_bev.png
+```
+
+nav 侧建图：沿环形走廊开一圈（真实 U 形），`path_climb` 全是 flat，规划器
+对墙保持 strict；四个任务点 WN/EN/ES/WS 用 `nav_cycle` 按环序发（脚本自带
+  `/nav/active` 长活保持——后端的一次性 false latch 会盖掉 `--once` 发布）。
+`tools/probes/target_cycle.py` 是另一种发法：直接发 `/control/target_pose`
+（与前端手动目标同一机制），额外发 `/control/target_heading` 指定终点朝向，
+配合栈侧 cmd_vel_control 的"终点段"逻辑（0.4 m 内直进、到位后原地对齐）。
+
+### 盲走策略（floorplan 现役）
+
+`assets/policy/go2_pie_blind_flat.onnx` 是在本仓 `mujoco/train/` 里用
+mjlab 对**部署同一份 `go2_pie.xml` + PIE 执行器契约**训练的盲走速度策略
+（45-D 单帧本体质感观测，无深度、无 GRU、无视觉输入；命令包络
+vx -0.5~1.0 / vy ±0.3 / wz ±0.8）。`sim/policy.py:load_policy` 按 ONNX
+输入名 `proprio` 自动路由到 `PieBlindOnnxPolicy`（needs_depth=False，
+不覆盖 PD）。floorplan 场景的 `hil_policy` 已切到它；训练/验收链与坑
+见 `train/README.md`。
+
+部署运行时平地扫描（`sweep` 工具在训练工作区）：0.2→0.195、0.3→0.301、
+0.5→0.500、1.0→1.009 m/s，倒退 0.3/0.5 与螃蟹 ±0.2~0.3 在 97~104%，
+wz ±0.3~0.8 全跟踪，零指令站立稳定，全程零摔倒。残余弱项：0.1 m/s
+以下跟踪减半（盲策略没有线速度观测，低速只能靠运动学推断，属物理
+下限），0.05 以下按设计保持站立。
+
+此前试过的 `go2_rl_gym` 预训练盲走 actor（`go2_rl_gym_moe_{137k,164k}`
+.onnx，`Go2RlGymOnnxPolicy` 适配层保留）只在其自带 MuJoCo 模型里能走、
+进 PIE 模型就站桩——别人家的狗 + torque 执行器，教训是"策略必须训在
+部署那份模型上"。
+
+### BEV 视频：采集直播状态，不要开环回放
+
+录 `/cmd_vel` 再喂给独立进程的 PieRuntime **不是**对栈行为的复现：录下的
+指令是闭环控制器对当时真实位姿的反应，回放从略有差异的初始状态出发必然
+漂移（实测表现为开局慢速撞墙/撞天井、腿型与轨迹对不上）。正确做法是直接
+采集直播状态：
+
+- `dog.py` 的 `QposTap` 每个控制 tick（50 Hz）把全部关节写进
+  `/dev/shm/mjsim_emu_qpos.bin`：`<QdI>` 头（seq, t, nq）+ nq 个 little-endian
+  double。状态环 `mjsim_emu_state.bin` 只有 base 位姿，够契约面用，但渲染
+  视频会得到僵直的四条腿。
+- `scripts/record_live_bev_qpos.py` 映射该文件 → 固定正交 BEV 逐帧渲染，
+  raw RGB24 走 stdout；同时订阅 `/control/target_pose` +
+  `/control/target_heading`，把当前 goal 画成圆环 + 十字 + 朝向箭头（黄色）。
+- DWA 选中的最优轨迹直接订 `/planning/trajectory_path`：planning_node 的
+  `publish_selected_path` 发的就是 argmin 那条 lattice（world 系、baselink
+  位置、`PATH_POSE_STRIDE=10` 抽稀，通常约 4–5 个点），画成品红折线 + 点 +
+  末端朝向箭头。它和 cmd_vel_control 消费的是同一条 Path，所以"狗站着不动、
+  品红线却指着前方"能一眼看出是执行侧的问题（低速 breakaway 不足），而不
+  是规划没给路。末尾朝向不能用 ROS 的 x-forward 约定解：Path 里的四元数是
+  本栈的 body +Z-forward（`_world_heading`），按旋转 +Z 取 atan2。
+- 轨迹超过 `--traj-ttl`（默认 1 s）没更新就隐藏，避免拿陈旧线误判；话题可
+  用 `--traj-topic` 覆盖。
+- 正交投影要点：`MjvCamera.orthographic` 不被渲染路径消费（A/B 无差异），
+  必须渲后设 `Renderer.scene.camera[0/1]`（MjvGLCamera）的 `orthographic=1`
+  和 planar frustum；`frustum_top/bottom` 与 **`frustum_width` 都是半宽**，
+  854×480 下取 ±2.0 / 3.56（= 4.0 m 高 × 16:9 的一半），写成 7.0 会把水平
+  方向压扁一半。
+
+```bash
+# 1) 起 emu（容器重建后 tools/probes 不在镜像里，先 cp 脚本进去）
+docker exec -d mjsim-dog bash -c 'source /opt/ros/jazzy/setup.bash && \
+  cd /workspace/tinynav-sim/mujoco && MUJOCO_GL=egl \
+  python3 /tmp/record_qpos.py --secs 110 > /tmp/live.raw 2>/tmp/live.log'
+# 2) 同域跑任务
+docker exec mjsim-dog bash -c 'source /opt/ros/jazzy/setup.bash && \
+  cd /workspace/tinynav-sim && python3 tools/probes/target_cycle.py --cycles 1'
+# 3) 编码（宿主）
+ffmpeg -f rawvideo -pix_fmt rgb24 -s 854x480 -r 30 -i /tmp/live.raw \
+  -c:v libvpx-vp9 -crf 30 -b:v 0 -deadline good -cpu-used 4 -row-mt 1 out.webm
+```
+
+`docker/run-mujoco-sim.sh` 会 bind `mujoco/dog.py`、`mujoco/hil.py`、
+`mujoco/sim`、`mujoco/assets/floorplan`——改这些直接重启容器即可，不用
+docker cp（cp 的改动会被容器重建冲掉）。
+
 
 **[OPEN-1 →RESOLVED] 容器内 MuJoCo viewer "冻结"（已结案：不是冻结，是缺 sync）**
 

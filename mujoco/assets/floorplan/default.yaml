@@ -1,0 +1,12 @@
+# Parametric flat stairwell plan (mujoco/sim/floorplan.py).
+# All dimensions in metres.  platform_width is fixed by the ring:
+# 2*flight_width + well_width; it is derived, so it is not written here
+# (writing a mismatched value fails loudly in FloorPlanParams).
+flight_len: 4.0
+flight_width: 0.8
+well_width: 0.4
+platform_len: 1.0
+wall_height: 2.0
+wall_thickness: 0.06
+floor_thickness: 0.10
+checker: true

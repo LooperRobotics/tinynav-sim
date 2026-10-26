@@ -23,6 +23,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass
+from typing import Any, Callable
 from pathlib import Path
 
 import mujoco
@@ -32,6 +33,7 @@ _HERE = Path(__file__).resolve().parent          # .../mujoco/sim
 ASSETS = _HERE.parent / "assets"                 # .../mujoco/assets
 
 from . import contract as C  # noqa: E402
+from . import floorplan as floorplan  # noqa: E402
 
 
 def _preprocess_scene(scene_path: Path, workdir: Path) -> Path:
@@ -129,6 +131,7 @@ RIG_FOVY = 82.85
 # cameras above carry the PIE rig's own fovy and feed the splat pipeline as
 # POSES ONLY -- their intrinsics are never projected through.
 CONTRACT_DEPTH_CAMERA = "infra1_contract"
+CONTRACT_RIGHT_CAMERA = "infra2_contract"
 
 TERRAIN_FRICTION = (0.6, 0.005, 0.0001)
 
@@ -150,6 +153,17 @@ class Scene:
     spawns: dict
     default_spawn: str
     hil_policy: str
+    # "splat" = gausscam RGB+depth; "mujoco" = native Renderer stereo/depth
+    render: str = "splat"
+    # procedural scenes: builder(params) -> MjSpec, plus the matching box and
+    # spawn helpers (None for mjcf/flat)
+    builder: Callable[..., Any] | None = None
+    boxes_fn: Callable[..., Any] | None = None
+    spawns_fn: Callable[..., Any] | None = None
+    params: Any | None = None
+
+
+_FLOORPLAN_DEFAULT = floorplan.load_params()
 
 
 SCENES: dict[str, Scene] = {
@@ -197,8 +211,33 @@ SCENES: dict[str, Scene] = {
         default_spawn="low",
         hil_policy="policy_24000_flat_omni.onnx",
     ),
+    # Parametric flat-floor stairwell plan for planning tests.  The physical
+    # world is one flat floor; the "stairs" are only the plan view (two long
+    # flights around a solid well, two short platforms).  Native MuJoCo
+    # stereo/depth; no splat.  Task points = the two platform centres (W/E).
+    "floorplan": Scene(
+        xml=None,
+        collision=None,
+        catch_z=-0.1,
+        ply="",
+        spawns=floorplan.floorplan_spawns(_FLOORPLAN_DEFAULT),
+        default_spawn="w",
+        # Blind velocity actor trained on THIS robot/contract with mjlab
+        # (mujoco/train/): 45-D proprio, no depth render, no PD override.
+        # Sweep vs the flat-omni depth expert: 0.2->0.195 / 0.3->0.301 /
+        # 0.5->0.500 / 1.0->1.009, reverse/crab/yaw 97-104%, zero falls.
+        hil_policy="go2_pie_blind_flat.onnx",
+        render="mujoco",
+        builder=floorplan.build_floorplan_spec,
+        boxes_fn=floorplan.floorplan_boxes,
+        spawns_fn=floorplan.floorplan_spawns,
+        params=_FLOORPLAN_DEFAULT,
+    ),
 }
 _ACTIVE = SCENES["map3"]
+_ACTIVE_BOXES: list | None = None
+_ACTIVE_SPAWNS: dict = _ACTIVE.spawns
+_ACTIVE_PARAMS: Any | None = None
 
 
 def get_scene(name: str) -> Scene:
@@ -213,6 +252,17 @@ def active_scene() -> Scene:
     return _ACTIVE
 
 
+def active_spawns() -> dict:
+    """Spawns of the LAST built scene (procedural scenes resolve them from
+    their params; everything else is the registry table)."""
+    return _ACTIVE_SPAWNS
+
+
+def active_params() -> Any | None:
+    """Params of the LAST built procedural scene, else None."""
+    return _ACTIVE_PARAMS
+
+
 @dataclass(frozen=True)
 class Bindings:
     """Indices into MjModel/MjData the runtime and observers need."""
@@ -225,6 +275,8 @@ class Bindings:
     actuator_ids: np.ndarray
     depth_camera_id: int
     depth_camera_geom_id: int  # -1 when the camera shell is absent (flat)
+    contract_left_camera_id: int
+    contract_right_camera_id: int
 
 
 def _configure_robot_spec(spec: mujoco.MjSpec) -> None:
@@ -314,6 +366,32 @@ def _add_depth_camera_and_shell(base) -> None:
     )
 
 
+def _add_contract_cameras(base) -> None:
+    """The looper contract stereo pair: left = infra1_contract (the existing
+    mesh-depth camera), right at the oracle 99.6 mm baseline along the left
+    camera's raw x axis.  Both carry the contract vertical fovy, so a native
+    MuJoCo render at 544x640 has K = camera_info."""
+    from hil import BASELINE, CONTRACT_FOVY_DEG, quat_wxyz_to_mat
+
+    left_pos = np.array(
+        [RIG_POS[0], RIG_Y["infra1"], RIG_POS[2]], dtype=float)
+    base.add_camera(
+        name=CONTRACT_DEPTH_CAMERA,
+        pos=left_pos.tolist(),
+        quat=RIG_QUAT_WXYZ,
+        fovy=CONTRACT_FOVY_DEG,
+    )
+    # raw camera x is the image-right axis; a pure-x translation keeps the
+    # pair rectified (same rotation) and matches tf_static's left->right.
+    right_pos = left_pos + quat_wxyz_to_mat(RIG_QUAT_WXYZ)[:, 0] * BASELINE
+    base.add_camera(
+        name=CONTRACT_RIGHT_CAMERA,
+        pos=right_pos.tolist(),
+        quat=RIG_QUAT_WXYZ,
+        fovy=CONTRACT_FOVY_DEG,
+    )
+
+
 def _apply_plant_options(spec: mujoco.MjSpec) -> None:
     spec.option.timestep = C.PHYSICS_DT
     spec.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
@@ -358,6 +436,10 @@ def _bindings(model: mujoco.MjModel, shell_id: int) -> Bindings:
         actuator_ids=actuator_ids,
         depth_camera_id=id_of(mujoco.mjtObj.mjOBJ_CAMERA, DEPTH_CAMERA_NAME),
         depth_camera_geom_id=shell_id,
+        contract_left_camera_id=id_of(
+            mujoco.mjtObj.mjOBJ_CAMERA, CONTRACT_DEPTH_CAMERA),
+        contract_right_camera_id=id_of(
+            mujoco.mjtObj.mjOBJ_CAMERA, CONTRACT_RIGHT_CAMERA),
     )
 
 
@@ -378,6 +460,11 @@ def _validate(model: mujoco.MjModel, b: Bindings) -> None:
     if not np.isclose(float(model.cam_fovy[b.depth_camera_id]), C.DEPTH_FOVY_DEG,
                       atol=1e-10):
         raise ValueError("depth camera fovy drifted from contract")
+    from hil import CONTRACT_FOVY_DEG
+    for cid in (b.contract_left_camera_id, b.contract_right_camera_id):
+        if not np.isclose(float(model.cam_fovy[cid]), CONTRACT_FOVY_DEG,
+                          atol=1e-10):
+            raise ValueError("contract stereo camera fovy drifted")
     if float(model.opt.timestep) != C.PHYSICS_DT:
         raise ValueError("scene option timestep is not PIE's 0.005")
     if int(model.opt.integrator) != int(mujoco.mjtIntegrator.mjINT_IMPLICITFAST):
@@ -407,25 +494,46 @@ def _compile(scene_spec: mujoco.MjSpec, with_shell: bool):
     return model, b
 
 
-def build_model(scene_name: str = "map3") -> tuple[mujoco.MjModel, Bindings]:
+def build_model(scene_name: str = "map3", params: Any | None = None
+                ) -> tuple[mujoco.MjModel, Bindings]:
     """Scene <name> + training go2 + PIE profile -> (model, bindings).
-    Sets the active scene for reset_to_spawn's z-snapping."""
-    global _ACTIVE
+
+    Sets the active scene/spawns/boxes for reset_to_spawn's z-snapping.
+    `params` is only meaningful for procedural scenes (floorplan); it
+    defaults to the scene's registered params.
+    """
+    global _ACTIVE, _ACTIVE_BOXES, _ACTIVE_SPAWNS, _ACTIVE_PARAMS
     sc = get_scene(scene_name)
     _ACTIVE = sc
-    if sc.xml is None:
+    _ACTIVE_BOXES = None
+    _ACTIVE_SPAWNS = sc.spawns
+    _ACTIVE_PARAMS = None
+
+    if sc.builder is not None:
+        p = params if params is not None else sc.params
+        scene = sc.builder(p)
+        _ACTIVE_BOXES = sc.boxes_fn(p) if sc.boxes_fn is not None else None
+        _ACTIVE_SPAWNS = (sc.spawns_fn(p) if sc.spawns_fn is not None
+                          else sc.spawns)
+        _ACTIVE_PARAMS = p
+        attach_pos, attach_yaw = _ACTIVE_SPAWNS[sc.default_spawn]
+        attach_pos = tuple(attach_pos)
+    elif sc.xml is None:
         return build_flat_model()
-    scene = mujoco.MjSpec.from_file(
-        str(_preprocess_scene(sc.xml, ASSETS / ".compose"))
-    )
+    else:
+        scene = mujoco.MjSpec.from_file(
+            str(_preprocess_scene(sc.xml, ASSETS / ".compose"))
+        )
+        attach_pos, attach_yaw = SPAWN_XYZ, SPAWN_YAW_DEG
+
     # Training terrain friction on the whole map (boxes + catch floor).
     for geom in scene.geoms:
         geom.friction[:] = TERRAIN_FRICTION
 
     robot = _load_robot_spec()
-    yaw = np.radians(SPAWN_YAW_DEG)
+    yaw = np.radians(attach_yaw)
     frame = scene.worldbody.add_frame(
-        pos=list(SPAWN_XYZ), quat=[np.cos(yaw / 2), 0, 0, np.sin(yaw / 2)]
+        pos=list(attach_pos), quat=[np.cos(yaw / 2), 0, 0, np.sin(yaw / 2)]
     )
     base = next(b for b in robot.worldbody.bodies if b.name == "base_link")
     frame.attach_body(base, "")
@@ -437,27 +545,30 @@ def build_model(scene_name: str = "map3") -> tuple[mujoco.MjModel, Bindings]:
             name=name, pos=[RIG_POS[0], y, RIG_POS[2]], quat=RIG_QUAT_WXYZ
         )
         cam.fovy = RIG_FOVY
-    from hil import CONTRACT_FOVY_DEG  # the looper contract's single source
-
-    base_in_scene.add_camera(
-        name=CONTRACT_DEPTH_CAMERA,
-        pos=[RIG_POS[0], RIG_Y["infra1"], RIG_POS[2]],
-        quat=RIG_QUAT_WXYZ,
-        fovy=CONTRACT_FOVY_DEG,
-    )
+    _add_contract_cameras(base_in_scene)
     _apply_plant_options(scene)
 
     model, b = _compile(scene, with_shell=True)
 
-    # spawn sanity: depth camera = base +x pitched down 20deg, i.e. world
-    # (-cos20, 0, -sin20) at spawn yaw 180.
+    # spawn sanity: front_depth looks along base +x, pitched down 20 deg.
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
     cid = b.depth_camera_id
     fwd = -data.cam_xmat[cid].reshape(3, 3)[:, 2]
-    want = (-np.cos(np.radians(20)), 0.0, -np.sin(np.radians(20)))
-    if abs(fwd[0] - want[0]) > 0.01 or abs(fwd[2] - want[2]) > 0.01:
+    pitch = np.radians(20.0)
+    want = (np.cos(yaw) * np.cos(pitch), np.sin(yaw) * np.cos(pitch),
+            -np.sin(pitch))
+    if not np.allclose(fwd, want, atol=0.01):
         raise ValueError(f"front_depth forward {fwd}, want {want}")
+
+    # contract stereo pair: pure-x baseline, both cameras at the same fovy
+    from hil import BASELINE
+    p_l = data.cam_xpos[b.contract_left_camera_id]
+    p_r = data.cam_xpos[b.contract_right_camera_id]
+    base_dist = float(np.linalg.norm(p_r - p_l))
+    if abs(base_dist - BASELINE) > 1e-6:
+        raise ValueError(
+            f"contract stereo baseline {base_dist:.9f} != {BASELINE:.9f}")
     return model, b
 
 
@@ -468,6 +579,11 @@ def build_map3_model() -> tuple[mujoco.MjModel, Bindings]:
 
 def build_flat_model() -> tuple[mujoco.MjModel, Bindings]:
     """Ground plane + training go2 (upstream sim2sim 'flat' analogue)."""
+    global _ACTIVE, _ACTIVE_BOXES, _ACTIVE_SPAWNS, _ACTIVE_PARAMS
+    _ACTIVE = SCENES["flat"]
+    _ACTIVE_BOXES = None
+    _ACTIVE_SPAWNS = _ACTIVE.spawns
+    _ACTIVE_PARAMS = None
     scene = mujoco.MjSpec.from_string(
         "<mujoco model='pie_flat_smoke'>"
         "<worldbody>"
@@ -485,6 +601,7 @@ def build_flat_model() -> tuple[mujoco.MjModel, Bindings]:
     frame.attach_body(base, "")
     base_in_scene = next(b for b in scene.worldbody.bodies if b.name == "base_link")
     _add_depth_camera_and_shell(base_in_scene)
+    _add_contract_cameras(base_in_scene)
     _apply_plant_options(scene)
     return _compile(scene, with_shell=True)
 
@@ -497,9 +614,14 @@ def reset_to_spawn(model: mujoco.MjModel, data: mujoco.MjData, b: Bindings,
     landing_F4_east at (-8.75, 5.7) facing -y = yaw 270)."""
     mujoco.mj_resetData(model, data)
     root = b.root_qpos_adr
+    if pos is None and _ACTIVE_BOXES is not None:
+        # procedural scenes resolve their default spawn from the params
+        pos, yaw_deg = _ACTIVE_SPAWNS[_ACTIVE.default_spawn]
     if pos is not None:
         sc = _ACTIVE
-        if sc.collision is not None:
+        if _ACTIVE_BOXES is not None:
+            z = ground_top_at(_ACTIVE_BOXES, *pos[:2], pos[2]) + SPAWN_DROP
+        elif sc.collision is not None:
             boxes = load_boxes(str(sc.collision))
             z = ground_top_at(boxes, *pos[:2], pos[2]) + SPAWN_DROP
         else:
@@ -531,7 +653,9 @@ def reset_to_spawn(model: mujoco.MjModel, data: mujoco.MjData, b: Bindings,
 
 
 def main() -> int:
-    for name, fn in (("flat", build_flat_model), ("map3", build_map3_model)):
+    for name, fn in (("flat", build_flat_model),
+                     ("map3", build_map3_model),
+                     ("floorplan", lambda: build_model("floorplan"))):
         model, b = fn()
         print(f"[{name}] nq/nv/nu={model.nq}/{model.nv}/{model.nu} "
               f"dt={model.opt.timestep} integ={model.opt.integrator} "
