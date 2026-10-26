@@ -238,9 +238,9 @@ ffmpeg -f rawvideo -pix_fmt rgb24 -s 854x480 -r 30 -i /tmp/live.raw \
   -c:v libvpx-vp9 -crf 30 -b:v 0 -deadline good -cpu-used 4 -row-mt 1 out.webm
 ```
 
-`docker/run-mujoco-sim.sh` 会 bind `mujoco/dog.py`、`mujoco/hil.py`、
-`mujoco/sim`、`mujoco/assets/floorplan`——改这些直接重启容器即可，不用
-docker cp（cp 的改动会被容器重建冲掉）。
+`docker/run-mujoco-sim.sh` 会把整个 `mujoco/` 目录 bind 进容器——改仓库
+文件直接重启容器即可，不用 docker cp（cp 的改动会被容器重建冲掉；单文件
+bind 也不行：git 合并/检出会换 inode，旧 bind 继续指向合并前的旧文件）。
 
 **[OPEN-1 →RESOLVED] 容器内 MuJoCo viewer "冻结"（已结案：不是冻结，是缺 sync）**
 

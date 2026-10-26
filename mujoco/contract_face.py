@@ -213,7 +213,7 @@ def main() -> int:
 
         params = (load_params(args.floorplan_config)
                   if args.floorplan_config else None)
-        mujoco_model, _b = build_model(args.scene, params)
+        mujoco_model, _b = build_model(args.scene, "go2", params)
         left_cam = _b.contract_left_camera_id
         right_cam = _b.contract_right_camera_id
         fovy = float(mujoco_model.cam_fovy[left_cam])

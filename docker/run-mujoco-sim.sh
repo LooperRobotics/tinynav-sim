@@ -14,22 +14,18 @@ set -u
 FORM="${1:-hil}"; shift || true
 NAME="mjsim-${FORM}"
 
-# Repo bind mounts: sim/ (scene+emu code) and assets/floorplan/ (parametric
-# scene config) come from the host tree, so edits land on container restart
-# instead of needing docker cp -- which a container RECREATE silently
-# reverts to the baked copy.  MJSIM_BIND_REPO=0 falls back to the baked
+# Repo bind mount: the whole mujoco/ tree comes from the host, so edits land
+# on container restart instead of needing docker cp -- which a container
+# RECREATE silently reverts to the baked copy. Single-FILE binds are worse
+# than useless here: git checkout/merge rewrites files (new inode) and the
+# bind keeps serving the stale pre-merge inode. Only build/egg-info artifacts
+# of the vendored SDK live solely in the image -- its runtime copy is
+# pip-installed in site-packages. MJSIM_BIND_REPO=0 falls back to the baked
 # image tree; MJSIM_IMAGE picks the image (default mjsim:jazzy).
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIND_ARGS=()
-if [ "${MJSIM_BIND_REPO:-1}" != 0 ]; then
-  for sub in mujoco/sim mujoco/assets/floorplan; do
-    [ -d "$ROOT/$sub" ] && BIND_ARGS+=(-v "$ROOT/$sub:/workspace/tinynav-sim/$sub")
-  done
-  # entrypoints too: the qpos side-channel for offboard video capture lives
-  # in dog.py, and docker cp'd edits vanish on container recreate
-  for f in mujoco/dog.py mujoco/hil.py; do
-    [ -f "$ROOT/$f" ] && BIND_ARGS+=(-v "$ROOT/$f:/workspace/tinynav-sim/$f")
-  done
+if [ "${MJSIM_BIND_REPO:-1}" != 0 ] && [ -d "$ROOT/mujoco" ]; then
+  BIND_ARGS+=(-v "$ROOT/mujoco:/workspace/tinynav-sim/mujoco")
 fi
 MJSIM_IMAGE="${MJSIM_IMAGE:-mjsim:jazzy}"
 
