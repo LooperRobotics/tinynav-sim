@@ -99,7 +99,8 @@ def _argv_value(flag: str, default):
 
 
 def _pad_envelope(policy):
-    """Gamepad full deflection = the policy's training command envelope."""
+    """Gamepad full deflection (and the keyboard's range) = the policy's
+    training command envelope."""
     return policy.contract.COMMAND_LOW, policy.contract.COMMAND_HIGH
 
 
@@ -316,6 +317,7 @@ def main() -> int:
                     spawn_pos=pos, spawn_yaw_deg=yaw_deg,
                     substep_hook=sink.sample)
     pad.set_envelope(*_pad_envelope(policy))
+    kb.set_envelope(*_pad_envelope(policy))
     print(f"robot={robot.name} policy={_primary.name} "
           f"contract={policy.contract.name}", flush=True)
 
@@ -327,6 +329,7 @@ def main() -> int:
     if web_scene is not None:
         from webpanel import OperatorPanel
         panel = OperatorPanel(web_server, ROBOTS, robot.name, gamepad=pad,
+                              keyboard=kb,
                               on_button=lambda name: keys.__setitem__(name, True),
                               robot_select=False)
         panel.show_robot(robot.name, True, True, robot.has_policy("blind"))
@@ -497,6 +500,7 @@ def main() -> int:
                                     spawn_pos=pos, spawn_yaw_deg=yaw_deg,
                                     substep_hook=sink.sample)
                     pad.set_envelope(*_pad_envelope(policy))
+                    kb.set_envelope(*_pad_envelope(policy))
                     print(f"[SWITCH] {kind} policy={path.name}", flush=True)
                 except Exception as exc:      # noqa: BLE001
                     print(f"[SWITCH] {kind} refused: {exc}", flush=True)

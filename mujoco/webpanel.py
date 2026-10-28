@@ -9,8 +9,13 @@ untouched), drawn above its Scene / Visualization / Groups tabs:
   Perception      the robot's depth policy (default) or its blind one; locked
                   while the robot has only one of the two
   Gamepad         sim/gamepad.py control on/off (A on the pad toggles too)
-  Follow camera   chase view straight behind and above the robot (default
-                  on); off hands the camera back to the mouse
+  Track robot     chase view straight behind and above the robot (default
+                  on); off leaves the camera where it is, to move with the
+                  mouse or W/A/S/D/Q (the vendored client's camera keys)
+  Keyboard speed  held teleop keys drive this share of the active policy's
+                  training command range (sim/keyboard.py, default 50%)
+  controls        the teleop keys with their current speeds, and the camera
+                  keys
   Reset / Stop    the native viewer's R / Space
   policy depth    the policy's newest 60x86 depth frame (perception only),
                   turbo map: near red, DEPTH_MAX_M (3 m) and beyond dark blue
@@ -82,14 +87,16 @@ class FollowCamera:
 
 class OperatorPanel:
     def __init__(self, server, robots, robot: str, *, gamepad=None,
-                 on_button=None, robot_select: bool = True) -> None:
+                 keyboard=None, on_button=None, robot_select: bool = True) -> None:
         """robots: {name: sim.robots.Robot}; robot: the one being driven.
+        keyboard: the host's sim.keyboard.HoldCmd (its envelope already set).
         on_button("reset" | "stop") is called from viser's thread.
         robot_select=False shows the robot without the dropdown (hosts that
         cannot swap bodies at runtime)."""
         self.server = server
         self.robots = robots
         self.gamepad = gamepad
+        self.keyboard = keyboard
         self.follow_cam = FollowCamera()
         self._lock = threading.Lock()
         self._request: tuple[str, str | bool] | None = None
@@ -127,12 +134,23 @@ class OperatorPanel:
                      "B stops. Read from the sim host's /dev/input.")
             self.pad_cb.on_update(self._on_gamepad)
             self.follow = gui.add_checkbox(
-                "Follow camera", True,
-                hint="Chase view behind and above the robot; off frees the camera.")
+                "Track robot", True,
+                hint="Chase view behind and above the robot. Off: the camera "
+                     "stays put; move it with the mouse or W/A/S/D/Q.")
             self.follow.on_update(lambda _e: self.follow_cam.reset())
             for label, name in (("Reset to spawn", "reset"), ("Stop", "stop")):
                 btn = gui.add_button(label)
                 btn.on_click(lambda _e, _n=name: on_button and on_button(_n))
+            if keyboard is not None:
+                self.kb_speed = gui.add_slider(
+                    "Keyboard speed", min=10, max=100, step=5,
+                    initial_value=round(100 * keyboard.speed),
+                    hint="Held teleop keys drive this % of the active "
+                         "policy's training command range.")
+                self.kb_speed.on_update(self._on_kb_speed)
+            # sim/keyboard.py's hold-to-move keys (read from the host's
+            # /dev/input) and the vendored client's camera keys.
+            self.keys = gui.add_markdown(self._keys_text())
             self.depth = gui.add_image(
                 np.zeros((60 * DEPTH_UPSCALE, 86 * DEPTH_UPSCALE, 3), np.uint8),
                 label="Policy depth", format="jpeg", jpeg_quality=85)
@@ -158,6 +176,22 @@ class OperatorPanel:
     def _on_gamepad(self, _event) -> None:
         if self.gamepad is not None and not self._quiet:
             self.gamepad.enabled = bool(self.pad_cb.value)
+
+    def _on_kb_speed(self, _event) -> None:
+        self.keyboard.set_speed(self.kb_speed.value / 100.0)
+        self.keys.content = self._keys_text()
+
+    def _keys_text(self) -> str:
+        if self.keyboard is not None:
+            fwd, back, vy, wz = self.keyboard.hold_speeds()
+        else:
+            from sim.keyboard import VX_HOLD, VX_HOLD_BWD, VY_HOLD, WZ_HOLD
+            fwd, back, vy, wz = VX_HOLD, VX_HOLD_BWD, VY_HOLD, WZ_HOLD
+        return ("<small>键盘遥操（宿主全局，不用点网页）："
+                f"↑ 前进 {fwd:.2f} · ↓ 后退 {back:.2f} · ← / → 左 / 右转 {wz:.2f} · "
+                f"<b>,</b> / <b>.</b> 左 / 右横移 {vy:.2f}<br>"
+                "视角：鼠标左键旋转、右键平移、滚轮缩放；关掉 Track robot 后 "
+                "W / S 前后、A / D 左右、Q 下降（先点一下网页）</small>")
 
     def _frame_new_client(self, client) -> None:
         # Follow on: the next update() frames it. Off: start at the last
@@ -189,6 +223,7 @@ class OperatorPanel:
                 f"{self.robots[robot].label} has no "
                 f"{'blind' if has_perception else 'depth'} policy yet")
             self.depth.visible = self.depth_note.visible = perception
+            self.keys.content = self._keys_text()   # the new policy's range
         finally:
             self._quiet = False
         self.follow_cam.reset()

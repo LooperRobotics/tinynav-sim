@@ -22,7 +22,7 @@ from the last reset, and zero while |command| < 0.1 (training also zeroes
 commands up to that norm, so the same deadzone is applied to the command).
 Mirrors unitree_rl_mjlab src/tasks/velocity/mdp/observations.py::phase.
 
-BlindContract: unitree_rl_mjlab Unitree-Go2-Blind exports (blind_v0, branch
+BlindContract: unitree_rl_mjlab Unitree-{Go2,As2}-Blind exports (branch
 go2-blind). Same 47-D observation, no depth, no recurrent memory: the ONNX
 takes one `obs` input that IS the 10-frame term-major history (oldest
 first, reset backfilled -- TermHistory) and returns `actions`; its command
@@ -228,8 +228,8 @@ class StudentContract:
 
 
 class BlindContract(StudentContract):
-    """Blind policy (Unitree-Go2-Blind export): the student observation with
-    the blind joystick envelope."""
+    """Blind policy (Unitree-{Go2,As2}-Blind export): the student observation
+    with the blind joystick envelope."""
 
     def __init__(self, metadata: dict[str, str]) -> None:
         super().__init__(metadata, name="blind", command_low=BLIND_COMMAND_LOW,
