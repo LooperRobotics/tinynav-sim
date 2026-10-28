@@ -34,5 +34,44 @@ class TestHoldSpeeds(unittest.TestCase):
         self.assertAlmostEqual(kb.speed, 0.05)
 
 
+class FakePoll:
+    """InputPoll stand-in: the codes the test says are held."""
+
+    def __init__(self) -> None:
+        self.held: set = set()
+
+    def arrows(self) -> set:
+        return set(self.held)
+
+    def close(self) -> None:
+        pass
+
+
+class TestToggles(unittest.TestCase):
+    def test_m_toggles_marching_once_per_press_and_moves_nothing(self):
+        kb = K.HoldCmd(use_global=False)
+        kb._input_poll = poll = FakePoll()
+        self.assertFalse(kb.consume_march())
+        poll.held = {K.MARCH_KEY}                        # M pressed (global poll)
+        self.assertEqual(kb.active(), "idle")            # not a move key
+        self.assertEqual(kb.vector().tolist(), [0.0, 0.0, 0.0])
+        self.assertTrue(kb.consume_march())
+        self.assertFalse(kb.consume_march())             # held: one press
+        poll.held = set()
+        self.assertFalse(kb.consume_march())
+        poll.held = {K.MARCH_KEY, 265}                   # M with Up: both work
+        self.assertTrue(kb.consume_march())
+        self.assertGreater(float(kb.vector()[0]), 0.0)
+
+    def test_viewer_keys(self):
+        kb = K.HoldCmd(use_global=False)
+        self.assertTrue(kb.key(K.MARCH_KEY))
+        self.assertTrue(kb.consume_march())
+        self.assertFalse(kb.consume_stop())
+        kb.key(32)                                       # Space / GUI Stop
+        self.assertTrue(kb.consume_stop())
+        self.assertFalse(kb.consume_stop())
+
+
 if __name__ == "__main__":
     unittest.main()

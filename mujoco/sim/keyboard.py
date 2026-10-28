@@ -33,6 +33,7 @@ release-flush-to-idle path.
     Up      vx forward              Down    vx back
     Left    wz left                 Right   wz right
     ,       vy left                 .       vy right   (strafe)
+    M       march in place on / off (consume_march; the host keeps the state)
     Space   stop    R reset (viewer window / web GUI button)
 
 Hosts with a policy (view, hil) call set_envelope() with its training
@@ -61,10 +62,11 @@ RELEASE_FLUSH_S = 1.0   # post-release zero-flush window (gazebo RELEASE_FLUSH_S
 
 _ARROW_ACTIONS = {265: "vx+", 264: "vx-", 263: "wz+", 262: "wz-",
                   44: "vy+", 46: "vy-"}
+MARCH_KEY = 77   # M: a press toggles marching in place (not a held move key)
 
 # kernel input.h key codes -> the GLFW-ish codes used internally
 _KERNEL_TO_CODE = {103: 265, 108: 264, 105: 263, 106: 262,  # UP DOWN LEFT RIGHT
-                   51: 44, 52: 46}                          # COMMA DOT
+                   51: 44, 52: 46, 50: MARCH_KEY}           # COMMA DOT M
 # A device counts as a keyboard when it has the arrow keys.
 _KERNEL_ARROWS = (103, 108, 105, 106)
 
@@ -143,6 +145,9 @@ class HoldCmd:
         # (vx forward, vx back, vy, wz) a held key commands
         self._hold = (VX_HOLD, VX_HOLD_BWD, VY_HOLD, WZ_HOLD)
         self._reset_pending = False
+        self._march_pending = False   # M pressed (edge), taken by consume_march
+        self._stop_pending = False    # Space pressed (edge), taken by consume_stop
+        self._march_was_held = False
         self._cb_held: dict[int, float] = {}   # code -> last event time
         self._flush_until = 0.0    # gazebo RELEASE_FLUSH_S window after release
         self._was_held = False
@@ -163,7 +168,8 @@ class HoldCmd:
                     kc_map = {}
                     for name, code in (("Up", 265), ("Down", 264),
                                        ("Left", 263), ("Right", 262),
-                                       ("comma", 44), ("period", 46)):
+                                       ("comma", 44), ("period", 46),
+                                       ("m", MARCH_KEY)):
                         kc = dpy.keysym_to_keycode(XK.string_to_keysym(name))
                         if kc:
                             kc_map[int(kc)] = code
@@ -194,9 +200,13 @@ class HoldCmd:
         if k == 32:                        # Space: stop everything
             with self._lock:
                 self._cb_held.clear()
+            self._stop_pending = True
             return True
         if k == 82:                        # R: reset edge
             self._reset_pending = True
+            return True
+        if k == MARCH_KEY:                 # M: march toggle edge
+            self._march_pending = True
             return True
         return False
 
@@ -218,7 +228,13 @@ class HoldCmd:
             live = {k: t for k, t in self._cb_held.items()
                     if now - t <= CALLBACK_HOLD_S}
             self._cb_held = live
+            # M is a toggle, not a move key: its press edge only
+            march = MARCH_KEY in held
+            if march and not self._march_was_held:
+                self._march_pending = True
+            self._march_was_held = march
         held |= set(live)
+        held.discard(MARCH_KEY)
         return held
 
     def set_envelope(self, low, high) -> None:
@@ -278,6 +294,19 @@ class HoldCmd:
     def consume_reset(self) -> bool:
         edge = self._reset_pending
         self._reset_pending = False
+        return edge
+
+    def consume_march(self) -> bool:
+        """M pressed since the last call (toggle marching in place)."""
+        self._held_set()     # the global poll's press edge
+        edge = self._march_pending
+        self._march_pending = False
+        return edge
+
+    def consume_stop(self) -> bool:
+        """Space / the GUI Stop since the last call."""
+        edge = self._stop_pending
+        self._stop_pending = False
         return edge
 
     def start(self):

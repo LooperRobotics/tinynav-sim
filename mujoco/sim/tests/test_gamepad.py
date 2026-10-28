@@ -93,6 +93,23 @@ class TestGamepad(unittest.TestCase):
         self.pipe.send((G.EV_KEY, G.BTN_EAST, 0))
         self.assertGreater(float(cmd.vector()[0]), 0.9)
 
+    def test_x_or_y_toggles_marching_once_per_press(self):
+        cmd = source(self.pipe, enabled=False)           # works with control off
+        self.assertFalse(cmd.consume_march())
+        self.pipe.send((G.EV_KEY, G.BTN_NORTH, 1))
+        cmd.poll()
+        self.assertTrue(cmd.consume_march())
+        self.assertFalse(cmd.consume_march())            # taken
+        cmd.poll()                                       # still held: no new press
+        self.assertFalse(cmd.consume_march())
+        self.pipe.send((G.EV_KEY, G.BTN_NORTH, 0))
+        cmd.poll()
+        self.assertFalse(cmd.consume_march())            # release
+        self.pipe.send((G.EV_KEY, G.BTN_WEST, 1))         # Y on other mappings
+        cmd.poll()
+        self.assertTrue(cmd.consume_march())
+        self.assertFalse(cmd.enabled)                    # A's toggle untouched
+
     def test_right_stick_falls_back_to_abs_z(self):
         pipe = PipePad({code: (128, 0, 255) for code in (G.ABS_X, G.ABS_Y, G.ABS_Z)})
         try:

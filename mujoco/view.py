@@ -6,9 +6,10 @@ headless viser scene (--view web): no DISPLAY/GLFW dependency, an order of
 magnitude cheaper than the native viewer. Its operator panel (webpanel.py,
 top-right corner of the page) picks the robot (sim/robots.py: switching
 reloads the body and its policy), toggles the perception policy (depth;
-off = the robot's blind policy, once it has one) and the gamepad, follows
-the robot with a chase camera straight behind and above it, shows the
-policy's depth input, and carries the Reset/Stop buttons. The dog-eye splat
+off = the robot's blind policy, once it has one) and the gamepad, keeps
+the view on the robot and turned with it (the browser's orbit/zoom/pan
+circle it as it walks), shows the policy's depth input, and carries the Reset/Stop
+buttons. The dog-eye splat
 is NOT rendered by default -- `--preview` builds the wgpu splat pipeline
 and serves it as an MJPEG page for a second screen:
 
@@ -31,7 +32,9 @@ this driver (kernel error 15 after DONE).
 """
 from __future__ import annotations
 
+import copy
 import ctypes
+import math
 import os
 import sys
 import threading
@@ -62,19 +65,25 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
+from sim.accel import AccelLimit  # noqa: E402
 from sim.gamepad import GamepadCmd, GamepadOverride  # noqa: E402
+from sim.guard import WallGuard  # noqa: E402
 from sim.keyboard import ConstantCmd, HoldCmd, KeyboardOverride  # noqa: E402
 from sim.plant import (  # noqa: E402
+    SCENES,
     build_model,
     get_scene,
     reset_to_spawn,
+    web_view_model,
 )
 from sim.policy import PieOnnxPolicy  # noqa: E402
 from sim.robots import DEFAULT_ROBOT, ROBOTS, get_robot  # noqa: E402
 from sim.runtime import DepthCamera, PieRuntime  # noqa: E402
+from sim.thermal import HipThermal  # noqa: E402
 
 CONTROL_DT = 0.02
-RENDER_HZ = 15.0
+RENDER_HZ = 15.0   # --preview: splat render + MJPEG push
+WEB_HZ = 50.0      # web viewer only: scene + robot tracking every control tick
 CAM = "infra1"
 
 
@@ -181,17 +190,58 @@ def _argv_value(flag: str, default):
     return sys.argv[sys.argv.index(flag) + 1] if flag in sys.argv else default
 
 
+# build_model once per (scene, robot): a robot switch then copies a compiled
+# model (~30 ms) instead of compiling it again (up to 0.3 s). Every World gets
+# its own copy -- worlds and their web scenes mutate theirs. _MESHES holds the
+# web scene's merged body meshes per (scene, robot), keyed by the model's ids.
+_MODELS: dict[tuple[str, str], tuple] = {}
+_MESHES: dict[tuple[str, str], dict] = {}
+
+
+def _compiled(scene_name: str, robot: str):
+    key = (scene_name, robot)
+    if key not in _MODELS:
+        _MODELS[key] = build_model(scene_name, robot)
+    model, b = _MODELS[key]
+    return copy.deepcopy(model), b        # Bindings is frozen: shared
+
+
+_BOX_CORNERS = np.array([(x, y, z) for x in (-1, 1) for y in (-1, 1)
+                         for z in (-1, 1)], dtype=np.float64)
+
+
+def robot_length(model, data, b) -> float:
+    """Nose-to-tail span (m) of the robot's shown geoms along its heading, in
+    the current pose: the web view frames it from a multiple of it."""
+    mujoco.mj_kinematics(model, data)
+    joint = int(np.flatnonzero(model.jnt_qposadr == b.root_qpos_adr)[0])
+    heading = data.xmat[model.jnt_bodyid[joint]].reshape(3, 3)[:, 0].copy()
+    heading[2] = 0.0
+    heading /= np.linalg.norm(heading)
+    shown = ((model.body_weldid[model.geom_bodyid] != 0)
+             & (model.geom_group < 3) & (model.geom_rgba[:, 3] > 0))
+    lo, hi = np.inf, -np.inf
+    for g in np.flatnonzero(shown):
+        corners = (_BOX_CORNERS * model.geom_aabb[g, 3:] + model.geom_aabb[g, :3]
+                   ) @ data.geom_xmat[g].reshape(3, 3).T + data.geom_xpos[g]
+        along = corners @ heading
+        lo, hi = min(lo, along.min()), max(hi, along.max())
+    return float(hi - lo)
+
+
 class World:
     """One robot in the scene: plant, policy, depth camera, runtime. The
     depth camera (EGL) is opened by start() -- after the splat pipeline's
-    wgpu init on first boot (see main)."""
+    wgpu init on first boot (see main). `start` = (pos, yaw_deg) stands the
+    robot there instead of at the spawn (a robot switch keeps the place);
+    Reset still goes back to pos/yaw_deg."""
 
     def __init__(self, scene_name: str, robot: str, kind: str, cmd, pos,
                  yaw_deg: float, policy_path: str | None = None,
-                 wall_alpha: float = 1.0) -> None:
+                 wall_alpha: float = 1.0, start=None) -> None:
         self.robot = get_robot(robot)
         self.scene_name, self.pos, self.yaw_deg, self.cmd = scene_name, pos, yaw_deg, cmd
-        self.model, self.b = build_model(scene_name, robot)
+        self.model, self.b = _compiled(scene_name, robot)
         self.model.vis.quality.shadowsize = 0          # shadows off (viewer + renders)
         # shaft walls: BLEND alpha stacks PER-PANEL now (webviewer emits
         # translucent geoms as separate meshes), so the XML's 0.1 alpha
@@ -201,12 +251,42 @@ class World:
                  & (self.model.geom_rgba[:, 3] < 0.5))
         self.model.geom_rgba[walls, 3] = wall_alpha
         self.data = mujoco.MjData(self.model)
+        start_pos, start_yaw = start if start is not None else (pos, yaw_deg)
         reset_to_spawn(self.model, self.data, self.b, settle=True,
-                       pos=pos, yaw_deg=yaw_deg)
+                       pos=start_pos, yaw_deg=start_yaw)
+        self.length = robot_length(self.model, self.data, self.b)
+        # what the web view shows opaque (its colour rule: material rgba
+        # first): static geoms of the shown groups 0-2, walls at
+        # wall_alpha < 0.5 excluded -- the surfaces ray() stops at
+        m = self.model
+        alpha = m.geom_rgba[:, 3].copy()
+        alpha[m.geom_matid >= 0] = m.mat_rgba[m.geom_matid[m.geom_matid >= 0], 3]
+        self._opaque = ((m.body_weldid[m.geom_bodyid] == 0)
+                        & (m.geom_group < 3) & (alpha >= 0.5))
+        self._ray_geom = np.zeros(1, np.int32)
         self.kind = kind
         self.policy = self._load_policy(kind, policy_path)
+        self.policy_path = policy_path   # a --policy override (None: the registry's)
         self.cam = None
         self.rt = None
+
+    def ray(self, origin, direction, reach: float):
+        """Distance (m) along the unit `direction` from `origin` to the first
+        surface the web view shows opaque, or None within `reach`; the robot
+        and the see-through walls are looked past."""
+        origin = np.asarray(origin, dtype=np.float64)
+        direction = np.asarray(direction, dtype=np.float64)
+        t = 0.0
+        for _ in range(32):
+            h = mujoco.mj_ray(self.model, self.data, origin + t * direction,
+                              direction, None, 1, -1, self._ray_geom)
+            if h < 0 or t + h >= reach:
+                return None
+            t += h
+            if self._opaque[self._ray_geom[0]]:
+                return t
+            t += 1e-4
+        return None
 
     def _load_policy(self, kind: str, policy_path: str | None):
         if policy_path is None:
@@ -230,16 +310,27 @@ class World:
         """Swap perception <-> blind in place (robot state kept, fresh
         policy memory and histories)."""
         policy = self._load_policy(kind, None)
+        old = self.rt
         self.rt = PieRuntime(self.model, self.b, self.data, policy, self.cam,
                              self.cmd, spawn_pos=self.pos,
                              spawn_yaw_deg=self.yaw_deg)
-        self.policy, self.kind = policy, kind
+        if old is not None:
+            old.close()
+        self.policy, self.kind, self.policy_path = policy, kind, None
+
+    @property
+    def depth_spec(self):
+        """The driving policy's depth frame (contract_v2.DepthSpec; None when
+        blind)."""
+        return self.rt.depth_spec if self.rt is not None and self.rt.uses_depth else None
 
     def reset(self) -> None:
         reset_to_spawn(self.model, self.data, self.b, settle=True,
                        pos=self.pos, yaw_deg=self.yaw_deg)
 
     def close(self) -> None:
+        if self.rt is not None:
+            self.rt.close()
         if self.cam is not None:
             self.cam.close()
 
@@ -256,8 +347,10 @@ def main() -> int:
     sc = get_scene(scene_name)
     spawn = _argv_value("--spawn", sc.default_spawn)
     robot_name = _argv_value("--robot", DEFAULT_ROBOT)
-    get_robot(robot_name)
     kind = "blind" if "--blind" in sys.argv else "perception"
+    if not get_robot(robot_name).has_policy(kind):
+        # Same fallback as switching robots in the panel.
+        kind = "blind" if kind == "perception" else "perception"
     policy_path = _argv_value("--policy", None)
     view_mode = _argv_value("--view", "web")    # web | glfw
     web_port = int(_argv_value("--web-port", "8012"))
@@ -274,16 +367,23 @@ def main() -> int:
     pos, yaw_deg = sc.spawns[spawn]
 
     # Command sources: held arrows win (KeyboardOverride), then the gamepad
-    # while its control is on, else zeros. Reset/Stop ride kb.key (82 / 32)
-    # -- the codes the native viewer key_callback would receive.
+    # while its control is on, else zeros; AccelLimit ramps what they ask for
+    # (sim/accel.py; the pad's B stops at once) and WallGuard stops it in
+    # front of walls (sim/guard.py; `world` is read when it runs, so it follows
+    # switches). Reset/Stop ride kb.key (82 / 32) -- the codes the native
+    # viewer key_callback would receive.
     kb = HoldCmd()
     pad = GamepadCmd(enabled=use_gamepad)
-    cmd = KeyboardOverride(kb, GamepadOverride(pad, ConstantCmd(vx=0.0)))
+    mux = KeyboardOverride(kb, GamepadOverride(pad, ConstantCmd(vx=0.0)))
+    accel = AccelLimit(mux, brake=lambda: pad.stop_held)
+    cmd = WallGuard(accel, lambda: world.rt)
     world = World(scene_name, robot_name, kind, cmd, pos, yaw_deg,
                   policy_path=policy_path,
                   wall_alpha=wall_alpha if view_mode == "web" else 1.0)
     pad.set_envelope(*world.pad_envelope())
     kb.set_envelope(*world.pad_envelope())
+    # the hips' estimated motor temperatures (panel plot), restarted per robot
+    thermal = HipThermal(world.data, world.b, world.robot.name)
 
     # wgpu splat pipeline (--preview only, its one consumer): static scene
     # only, exactly like hil -- GaussianCloud.from_ply -> RAW INRIA values
@@ -342,29 +442,46 @@ def main() -> int:
     if view_mode == "web":
         try:
             import viser
-            from webpanel import OperatorPanel
+            from webpanel import (OperatorPanel, add_depth_camera, base_yaw, guard_status,
+                                  march_status, sync_depth_camera)
             from webviewer import ViserMujocoScene
             web_server = viser.ViserServer(port=web_port)
 
             def _on_button(name: str) -> None:
                 kb.key({"reset": 82, "stop": 32}[name])
 
-            panel = OperatorPanel(web_server, ROBOTS, world.robot.name,
-                                  gamepad=pad, keyboard=kb, on_button=_on_button)
+            # Map dropdown: the scene registry; not with --preview (its splat
+            # pipeline holds the boot map's cloud)
+            panel = OperatorPanel(
+                web_server, ROBOTS, world.robot.name, gamepad=pad, keyboard=kb,
+                accel=accel, guard=cmd, on_button=_on_button, scene=scene_name,
+                scenes=None if preview else {n: s.label or n for n, s in SCENES.items()})
 
             def _build_web_scene():
                 web_server.scene.reset()
-                scene = ViserMujocoScene(web_server, world.model, num_envs=1)
-                # "Track camera" force-aims every client at the world ORIGIN
-                # -- the dog lives at the spawn, so tracking off (and with it
-                # the checkbox, webviewer/__init__.py); the panel's Track
-                # robot frames it.
+                # its own model copy: the navcore unit drawn on the head,
+                # the depth camera's model untouched
+                scene = ViserMujocoScene(
+                    web_server, web_view_model(world.model, world.robot), num_envs=1,
+                    mesh_cache=_MESHES.setdefault((scene_name, world.robot.name), {}))
+                # mjviser's own tracking (the raw base pinned to the origin,
+                # its "Track camera" checkbox) off: the panel's Track robot
+                # shifts and turns the scene itself, by the low-passed base
+                # and heading.
                 scene.camera_tracking_enabled = False
+                scene.scene_offset = panel.scene_offset
+                scene.scene_yaw = panel.scene_yaw
+                # The panel frames new pages too (behind the robot), so a
+                # switch leaves views alone.
+                scene.frame_clients = False
                 scene.show_contact_points = True
                 # hulls render at 0.5 opacity over EVERY geom and read
                 # opaque; collision viewing is covered by the G3 group
                 # toggle instead.
                 scene.show_convex_hull = False
+                # the policy's depth camera, a small pyramid (depth policy only)
+                add_depth_camera(scene, world.length, world.depth_spec)
+                scene.show_camera_frustums = world.kind == "perception"
                 scene.update_from_mjdata(world.data)
                 return scene
 
@@ -372,42 +489,94 @@ def main() -> int:
             tabs = web_scene.create_visualization_gui()
             panel.show_robot(world.robot.name, world.kind == "perception",
                              world.robot.has_policy("perception"),
-                             world.robot.has_policy("blind"))
+                             world.robot.has_policy("blind"), world.length)
             # viser silently bumps to the next free port when busy -- print
             # the ACTUAL bound port, not the request.
             print(f"[WEBVIEWER] http://0.0.0.0:{web_server.get_port()}  "
-                  f"(wall alpha={wall_alpha}, operator panel: robot/"
+                  f"(wall alpha={wall_alpha}, operator panel: map/robot/"
                   "perception/gamepad/track robot, Reset/Stop)", flush=True)
         except Exception as exc:      # noqa: BLE001
             print(f"[WEBVIEWER] init failed: {exc}", flush=True)
             web_scene = panel = None
+        if panel is not None:
+            # Compile and merge the other robots now, before the loop runs,
+            # so a switch does not pay for it on the control thread.
+            t0 = time.perf_counter()
+            try:
+                for name, r in ROBOTS.items():
+                    if name != world.robot.name and not r.missing():
+                        m, _ = _compiled(scene_name, name)
+                        ViserMujocoScene.fill_mesh_cache(
+                            web_view_model(m, r), _MESHES.setdefault((scene_name, name), {}))
+                print(f"[WEBVIEWER] switch cache: {len(_MODELS)} robots in "
+                      f"{time.perf_counter() - t0:.1f} s", flush=True)
+            except Exception as exc:      # noqa: BLE001 -- switches still work, slower
+                print(f"[WEBVIEWER] switch cache failed: {exc}", flush=True)
 
     def _switch(request) -> None:
         """Apply a panel request on the control thread (between ticks)."""
-        nonlocal world, web_scene, tabs, ad
+        nonlocal world, web_scene, tabs, ad, thermal, scene_name, sc, spawn, pos, yaw_deg
         what, value = request
         try:
             if what == "perception":
                 kind_new = "perception" if value else "blind"
                 if kind_new != world.kind:
                     world.set_kind(kind_new)
+                    if world.depth_spec is not None:
+                        # a navcore student moves the camera: redraw its pyramid
+                        sync_depth_camera(web_scene, world.model, world.depth_spec, world.length)
+            elif what == "scene":
+                if value != scene_name:
+                    # the same robot and policy in the new map, at its spawn
+                    t0 = time.perf_counter()
+                    sc_new = get_scene(value)
+                    pos_new, yaw_new = sc_new.spawns[sc_new.default_spawn]
+                    new = World(value, world.robot.name, world.kind, cmd, pos_new, yaw_new,
+                                policy_path=world.policy_path, wall_alpha=wall_alpha)
+                    new.start()
+                    world.close()
+                    world = new
+                    scene_name, sc, spawn = value, sc_new, sc_new.default_spawn
+                    pos, yaw_deg = pos_new, yaw_new
+                    thermal = HipThermal(world.data, world.b, world.robot.name)
+                    panel.reset_temperatures()
+                    with web_server.atomic():
+                        web_scene = _build_web_scene()
+                        tabs.remove()
+                        tabs = web_scene.create_visualization_gui()
+                    # the robot is somewhere else now: every page behind it again
+                    panel.reframe()
+                    print(f"[SWITCH] map {scene_name} built in "
+                          f"{time.perf_counter() - t0:.2f} s", flush=True)
             elif value != world.robot.name:
                 # keep the perception choice when the new robot has it
                 robot = get_robot(value)
                 kind_new = (world.kind if robot.has_policy(world.kind)
                             else "perception" if robot.has_policy("perception")
                             else "blind")
+                # the new robot stands where the old one is, facing the same
+                # way, so the (tracked) view stays put
+                t0 = time.perf_counter()
+                root = world.b.root_qpos_adr
+                here = tuple(float(v) for v in world.data.qpos[root:root + 3])
+                heading = math.degrees(base_yaw(world.data.qpos[root + 3:root + 7]))
                 new = World(scene_name, value, kind_new, cmd, pos, yaw_deg,
-                            wall_alpha=wall_alpha)
+                            wall_alpha=wall_alpha, start=(here, heading))
                 new.start()
                 world.close()
                 world = new
-                web_scene = _build_web_scene()
-                tabs.remove()
-                tabs = web_scene.create_visualization_gui()
+                thermal = HipThermal(world.data, world.b, world.robot.name)
+                panel.reset_temperatures()
+                # one atomic update: no frame of empty scene between robots
+                with web_server.atomic():
+                    web_scene = _build_web_scene()
+                    tabs.remove()
+                    tabs = web_scene.create_visualization_gui()
+                print(f"[SWITCH] built in {time.perf_counter() - t0:.2f} s",
+                      flush=True)
                 if pipe is not None:
                     ad = MuJoCoAdapter(world.model, world.data)
-            print(f"[SWITCH] robot={world.robot.name} kind={world.kind} "
+            print(f"[SWITCH] map={scene_name} robot={world.robot.name} kind={world.kind} "
                   f"policy={world.policy_name} "
                   f"contract={world.policy.contract.name}", flush=True)
         except Exception as exc:      # noqa: BLE001 -- keep driving the old one
@@ -419,7 +588,7 @@ def main() -> int:
         kb.set_envelope(*world.pad_envelope())
         panel.show_robot(world.robot.name, world.kind == "perception",
                          world.robot.has_policy("perception"),
-                         world.robot.has_policy("blind"))
+                         world.robot.has_policy("blind"), world.length, scene=scene_name)
 
     # native GLFW viewer (--view glfw only): 12 s wedge guard, headless
     # continuation on timeout (web viewer covers the no-display case).
@@ -456,11 +625,14 @@ def main() -> int:
                     pass
 
     quit_req = False
+    # marching in place: M / pad X-Y toggle it, Stop and Reset end it; the
+    # policy marches on a zero command if it was trained to (gait_march)
+    march = False
     fps = 0.0
     n_frames = 0
     t_last = time.perf_counter()
     t_view = t_last
-    period = 1.0 / RENDER_HZ
+    period = 1.0 / (RENDER_HZ if preview else WEB_HZ)
     next_ctrl = time.perf_counter()
     next_render = next_ctrl
 
@@ -472,8 +644,21 @@ def main() -> int:
                 _switch(request)
             if kb.consume_reset():
                 world.reset()
+                cmd.reset()
+                march = False
                 print("[RESET] back to spawn", flush=True)
+            if kb.consume_march() | pad.consume_march():
+                march = not march
+                print(f"[MARCH] {'on' if march else 'off'}", flush=True)
+            if (kb.consume_stop() or pad.stop_held) and march:
+                march = False
+                print("[MARCH] off (stop)", flush=True)
+            world.rt.march = march
             world.rt.tick()
+            thermal.step(CONTROL_DT)
+            if panel is not None:
+                panel.plot_temperatures(thermal.time, thermal.labels,
+                                        thermal.temperatures)
             next_ctrl = max(next_ctrl + CONTROL_DT, time.perf_counter())
         if now >= next_render:
             rt = world.rt
@@ -491,7 +676,7 @@ def main() -> int:
                             f"{world.robot.label} {variant} {fps:4.1f}fps "
                             f"vx={rt.command[0]:+.2f} vy={rt.command[1]:+.2f} "
                             f"wz={rt.command[2]:+.2f} "
-                            f"cmd={cmd.state:5s} "
+                            f"cmd={mux.state:5s} "
                             f"up={rt.base_uprightness():.2f} "
                             f"phy={rt.physics_ms:.1f} pol={rt.policy_ms:.1f}ms "
                             f"xyz={np.round(rt.base_pos(), 1)}",
@@ -516,18 +701,21 @@ def main() -> int:
             # web viewer refresh reads the LIVE mjData -> control thread
             # only (same race family as mj_copyData); throttled at the
             # render cadence, never from the render thread.
-            if web_scene is not None and now - t_view >= period:
-                web_scene.update_from_mjdata(world.data)
+            # half a period of slack: the block is paced by next_render already,
+            # and a strict >= period skips every frame that wakes earlier than
+            # the last one did (sleep jitter), ~1/3 of them
+            if web_scene is not None and now - t_view >= 0.5 * period:
                 root = world.b.root_qpos_adr
-                pad_txt = (("on " if pad.enabled else "off ") + pad.name
-                           if pad.connected else "no pad")
-                panel.update(
+                pad_txt = ("开" if pad.enabled else "关") if pad.connected else "未连"
+                web_scene.scene_offset, web_scene.scene_yaw = panel.update(
                     rt.base_pos(), world.data.qpos[root + 3:root + 7],
                     rt.depth_frame(),
-                    f"{world.robot.label} · {world.policy_name} · "
-                    f"cmd {rt.command[0]:+.2f} {rt.command[1]:+.2f} "
-                    f"{rt.command[2]:+.2f} ({cmd.state}) · gamepad {pad_txt} · "
-                    f"upright {rt.base_uprightness():.2f}")
+                    f"{world.policy_name} · cmd {rt.command[0]:+.2f} "
+                    f"{rt.command[1]:+.2f} {rt.command[2]:+.2f} · 手柄{pad_txt}"
+                    + march_status(march, world.policy.contract) + guard_status(cmd),
+                    ray=world.ray)
+                web_scene.show_camera_frustums = world.kind == "perception"
+                web_scene.update_from_mjdata(world.data)
                 t_view = now
 
             if use_mjv:
@@ -550,7 +738,7 @@ def main() -> int:
                         cam_txt = " cam=none"
                 except Exception as exc:      # noqa: BLE001
                     cam_txt = f" camERR={exc!r}"
-                print(f"{fps:4.1f}fps  cmd={cmd.state:5s} "
+                print(f"{fps:4.1f}fps  cmd={mux.state:5s} "
                       f"{world.robot.name} "
                       f"vx={rt.command[0]:+.2f} vy={rt.command[1]:+.2f} "
                       f"wz={rt.command[2]:+.2f} "

@@ -22,7 +22,8 @@ import mujoco
 import numpy as np
 
 from . import contract as C
-from .plant import Bindings, reset_to_spawn
+from .contract_v2 import PIE_DEPTH
+from .plant import Bindings, place_depth_shell, reset_to_spawn
 
 # Joint-target safety clamp around the default pose, as the real-robot deploy
 # applies it (go2-blind deploy.yaml: default +- 2.0 rad = raw action +- 8).
@@ -30,16 +31,31 @@ from .plant import Bindings, reset_to_spawn
 # raw policy output.
 ACTION_CLIP_RAD = 2.0
 
+# A policy may stand within this much (rad, per joint) of the robot's registry
+# stance; the plant then takes the policy's (go2-blind's finals of 2026-10-27
+# stand their hips at 0, the earlier exports at +-0.1).
+DEFAULT_POSE_TOLERANCE = 0.25
+
 
 class DepthCamera:
-    """Native MuJoCo optical-Z renderer matching the raw PIE camera."""
+    """Native MuJoCo optical-Z renderer matching the raw PIE camera (height x
+    width: PIE's 60 x 106 by default, a navcore student's frame otherwise)."""
 
-    def __init__(self, model: mujoco.MjModel, camera_id: int) -> None:
+    def __init__(self, model: mujoco.MjModel, camera_id: int,
+                 height: int = C.DEPTH_HEIGHT, width: int = C.DEPTH_RAW_WIDTH) -> None:
         self._model = model
         self._camera_id = camera_id
-        self._renderer = mujoco.Renderer(
-            model, height=C.DEPTH_HEIGHT, width=C.DEPTH_RAW_WIDTH
-        )
+        self._shape = (int(height), int(width))
+        # Single-sample buffer: a multisampled depth buffer resolves to one
+        # off-centre sample per pixel (NVIDIA EGL: ~0.5 cm median error, cm
+        # at stair edges); without MSAA the depth equals mj_ray's optical Z.
+        # offsamples is read when the context is made, so restore it after.
+        offsamples = int(model.vis.quality.offsamples)
+        model.vis.quality.offsamples = 0
+        try:
+            self._renderer = mujoco.Renderer(model, height=self._shape[0], width=self._shape[1])
+        finally:
+            model.vis.quality.offsamples = offsamples
         self._renderer.enable_depth_rendering()
         self._scene_option = mujoco.MjvOption()
         self._scene_option.geomgroup[:] = 0
@@ -60,7 +76,7 @@ class DepthCamera:
             data, camera=self._camera_id, scene_option=self._scene_option
         )
         depth = np.asarray(self._renderer.render(), dtype=np.float32)
-        if depth.shape != (C.DEPTH_HEIGHT, C.DEPTH_RAW_WIDTH):
+        if depth.shape != self._shape:
             raise ValueError(f"rendered depth has invalid shape {depth.shape}")
         misses = (
             ~np.isfinite(depth)
@@ -106,7 +122,25 @@ class PieRuntime:
         self._bind_contract()
         self.last_action = np.zeros(self.contract.NUM_ACTIONS, dtype=np.float32)
         self.proprio_history = self.contract.ProprioHistory()
-        self.depth_history = C.DepthHistory()
+        # The depth frame the policy was trained on: PIE's camera at the robot's
+        # mount, or its metadata's (a navcore student: its mount, field of view
+        # and frame size). The shared model's camera is set for it on binding,
+        # and a renderer of that size made here (close() closes it).
+        self.depth_spec = getattr(self.contract, "depth", None) or PIE_DEPTH
+        self._own_camera = None
+        if self.uses_depth:
+            self._place_depth_camera()
+            if not self.depth_spec.pie:
+                self._own_camera = self.camera = DepthCamera(
+                    model, b.depth_camera_id, *self.depth_spec.frame_shape)
+        # heading_error state (heading contracts; None otherwise)
+        self.heading = self.contract.HeadingError()
+        # go2-blind's speed clock (None: the fixed clock counted by control_step)
+        self.gait = self.contract.GaitClock()
+        # march in place on a zero command (only policies trained for it,
+        # contract.gait_march; set by the host)
+        self.march = False
+        self.depth_history = C.DepthHistory(frame_shape=self.depth_spec.frame_shape)
         self.control_step = 0
         self.latest_raw_depth = None
         self.command = np.zeros(3, dtype=np.float32)   # last command the policy saw
@@ -114,10 +148,34 @@ class PieRuntime:
         self.physics_ms = 0.0
         self._last_data_time = float(data.time)
 
+    def _place_depth_camera(self) -> None:
+        """The plant's depth camera where this policy's was in training: the
+        robot's mount and PIE's field of view, or its metadata's. A navcore
+        camera also gets the PIE shell out of its view (to the unit's box:
+        training has no shell)."""
+        spec, cam, robot = self.depth_spec, self.b.depth_camera_id, self.b.robot
+        pie = spec.pie or spec.camera_pos is None
+        self.model.cam_pos[cam] = robot.camera_pos if pie else spec.camera_pos
+        self.model.cam_quat[cam] = robot.camera_quat if pie else spec.camera_quat
+        self.model.cam_fovy[cam] = C.DEPTH_FOVY_DEG if spec.pie else spec.fovy_deg
+        place_depth_shell(self.model, robot, navcore=not spec.pie)
+        # the camera's world pose now (a swap keeps the state: no step runs
+        # before the first capture)
+        mujoco.mj_camlight(self.model, self.data)
+
+    def close(self) -> None:
+        """Release what this runtime made (a navcore student's renderer)."""
+        if self._own_camera is not None:
+            self._own_camera.close()
+            self._own_camera = None
+
     def _bind_contract(self) -> None:
         """Map the contract's joints and action groups onto the plant, and
         refuse a policy trained for another robot (joints, default pose or
-        PD gains differ)."""
+        PD gains differ). A policy standing within DEFAULT_POSE_TOLERANCE of
+        the robot's stance is bound and the plant takes its stance: the spawn
+        pose and settle targets of reset_to_spawn (the Bindings arrays, shared
+        with the host's world)."""
         k, b = self.contract, self.b
         names = b.joint_names
         if sorted(k.joint_names) != sorted(names):
@@ -129,12 +187,17 @@ class PieRuntime:
         self._dof_adr = b.joint_dof_adr[idx]
         default = np.asarray(k.default_joint_pos, dtype=np.float32)
         if not np.allclose(default, b.default_joint_pos[idx], atol=1e-3):
-            raise ValueError(f"policy {k.name!r} default pose does not match "
-                             f"robot {b.robot.name!r}")
+            if np.max(np.abs(default - b.default_joint_pos[idx])) > DEFAULT_POSE_TOLERANCE:
+                raise ValueError(f"policy {k.name!r} default pose does not match "
+                                 f"robot {b.robot.name!r}")
+            position = self.model.actuator_biasprm[b.actuator_ids[idx], 1] != 0.0
+            b.default_joint_pos[idx] = default
+            b.ctrl_default[idx] = np.where(position, default, b.ctrl_default[idx])
         meta = getattr(self.policy, "metadata", {})
         gains = {key: [float(v) for v in meta[key].split(",")]
                  for key in ("joint_stiffness", "joint_damping") if key in meta}
-        # (actuator ids, slice of the action vector, scale, default or None)
+        # (actuator ids, slice of the action vector, scale, default or None,
+        # joint dof addresses)
         self._action_map = []
         start = 0
         for group in k.action_groups:
@@ -143,7 +206,8 @@ class PieRuntime:
             stop = start + len(ids)
             offset = default[jidx] if group.kind == "position" else None
             self._action_map.append((ids, slice(start, stop),
-                                     np.float32(group.scale), offset))
+                                     np.float32(group.scale), offset,
+                                     self._dof_adr[jidx]))
             start = stop
             if group.kind == "position" and len(gains) == 2:
                 kp = np.asarray(gains["joint_stiffness"])[jidx]
@@ -171,6 +235,10 @@ class PieRuntime:
         reset_to_spawn(self.model, self.data, self.b, settle=True)
         self.last_action.fill(0.0)
         self.proprio_history.reset()
+        if self.heading is not None:
+            self.heading.reset()
+        if self.gait is not None:
+            self.gait.reset()
         self.depth_history.reset()
         self.policy.reset()
         self.control_step = 0
@@ -186,11 +254,17 @@ class PieRuntime:
         joint_pos = self.data.qpos[self._qpos_adr]
         joint_vel = self.data.qvel[self._dof_adr]
         # Students: training command envelope + deadzone, and the gait phase
-        # clock counted from the last reset (control_step). PIE: unshaped.
+        # clock counted from the last reset (control_step; the speed clock
+        # advances per call). PIE: unshaped.
         self.command = self.contract.shape_command(command)
+        heading_error = (None if self.heading is None
+                         else self.heading(quaternion, self.command[2]))
+        gait_phase = (None if self.gait is None else
+                      self.gait(self.command, march=self.march and self.contract.gait_march))
         return self.contract.build_proprioception(
             angular_velocity, quaternion, self.command,
             joint_pos, joint_vel, self.last_action, self.control_step,
+            heading_error=heading_error, gait_phase=gait_phase,
         )
 
     def depth_frame(self) -> np.ndarray | None:
@@ -209,6 +283,10 @@ class PieRuntime:
                        pos=self._spawn_pos, yaw_deg=self._spawn_yaw_deg)
         self.last_action.fill(0.0)
         self.proprio_history.reset()
+        if self.heading is not None:
+            self.heading.reset()
+        if self.gait is not None:
+            self.gait.reset()
         self.depth_history.reset()
         self.policy.reset()
         self.control_step = 0
@@ -233,7 +311,7 @@ class PieRuntime:
                 and self.control_step % C.DEPTH_UPDATE_PERIOD_STEPS == 0):
             raw_depth = self.camera.capture(self.data)
             self.latest_raw_depth = raw_depth
-            self.depth_history.append(C.preprocess_depth_z(raw_depth))
+            self.depth_history.append(self.depth_spec.preprocess(raw_depth))
 
         observation = self.build_observation(self.cmd_source.vector())
         self.proprio_history.append(observation)
@@ -244,12 +322,17 @@ class PieRuntime:
             self.depth_history.array if self.uses_depth else None,
         )
         self.policy_ms = (time.perf_counter() - t0) * 1e3
-        for ids, part, scale, offset in self._action_map:
+        brake = getattr(self.contract, "wheel_brake_rad_s", None)
+        for ids, part, scale, offset, dof in self._action_map:
             # position: default pose + scale * action; velocity: scale * action
             target = scale * action[part]
             if offset is not None:
                 target = np.clip(offset + target, offset - ACTION_CLIP_RAD,
                                  offset + ACTION_CLIP_RAD)
+            elif (brake is not None and not np.any(self.command)
+                  and np.all(np.abs(self.data.qvel[dof]) < brake)):
+                # Low-speed brake at a zero command, as in training.
+                target = np.zeros_like(target)
             if not np.all(np.isfinite(target)):
                 raise FloatingPointError("policy actuator target is non-finite")
             self.data.ctrl[ids] = target

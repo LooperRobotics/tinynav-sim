@@ -11,6 +11,9 @@ pads plugged in later are picked up within RESCAN_S.
     right stick X  wz            (ABS_RX; pads without it use ABS_Z)
     A / Cross      toggle gamepad control on/off
     B / Circle     stop: zero command while held
+    X / Y          march in place on / off (consume_march; the host keeps the
+                   state). Both: pads report the X label as BTN_X (0x133) or
+                   BTN_Y (0x134) depending on the driver / mode
 
 Stick deflection maps linearly onto the command envelope (the active
 policy's training envelope; GamepadCmd.set_envelope), past a DEADZONE.
@@ -34,6 +37,8 @@ EV_SYN, EV_KEY, EV_ABS = 0x00, 0x01, 0x03
 ABS_X, ABS_Y, ABS_Z, ABS_RX = 0x00, 0x01, 0x02, 0x03
 ABS_RY = 0x04
 BTN_SOUTH, BTN_EAST = 0x130, 0x131
+BTN_NORTH, BTN_WEST = 0x133, 0x134   # input.h BTN_X, BTN_Y
+MARCH_BUTTONS = (BTN_NORTH, BTN_WEST)
 
 DEADZONE = 0.12
 RESCAN_S = 2.0
@@ -159,6 +164,8 @@ class GamepadCmd:
         self._scan = scan
         self._next_scan = 0.0
         self._prev_a = False
+        self._prev_march = False
+        self._march_pending = False   # X / Y pressed (edge), taken by consume_march
         self.stop_held = False
         self.set_envelope(DEFAULT_LOW, DEFAULT_HIGH)
 
@@ -199,6 +206,10 @@ class GamepadCmd:
                 self.enabled = not self.enabled
                 print(f"[PAD] control {'ON' if self.enabled else 'off'}", flush=True)
             self._prev_a = a
+            march = any(b in self.pad.buttons for b in MARCH_BUTTONS)
+            if march and not self._prev_march:
+                self._march_pending = True
+            self._prev_march = march
             self.stop_held = BTN_EAST in self.pad.buttons
 
     def vector(self) -> np.ndarray:
@@ -218,6 +229,13 @@ class GamepadCmd:
     @property
     def connected(self) -> bool:
         return self.pad is not None
+
+    def consume_march(self) -> bool:
+        """X / Y pressed since the last call (toggle marching in place)."""
+        with self._lock:
+            edge = self._march_pending
+            self._march_pending = False
+        return edge
 
     def consume_reset(self) -> bool:
         return False

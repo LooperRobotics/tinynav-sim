@@ -557,7 +557,9 @@ def _can_merge_vertices(mesh: trimesh.Trimesh) -> bool:
   if not isinstance(mesh.visual, trimesh.visual.ColorVisuals):
     return True
   vc = mesh.visual.vertex_colors
-  if vc is None or len(set(map(tuple, vc))) <= 1:
+  # One color for all (vectorised: a set of per-vertex tuples took ~0.5 s
+  # for a 300k-vertex robot on every robot switch).
+  if vc is None or len(vc) == 0 or bool((vc == vc[0]).all()):
     return True
   # Check whether co-located vertices carry conflicting colors.
   rounded = np.round(mesh.vertices, decimals=6)

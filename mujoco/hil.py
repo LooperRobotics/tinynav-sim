@@ -71,9 +71,12 @@ from sim.plant import (  # noqa: E402
     build_model,
     get_scene,
     reset_to_spawn,
+    web_view_model,
 )
 from sim.policy import PieOnnxPolicy  # noqa: E402
+from sim.accel import AccelLimit  # noqa: E402
 from sim.gamepad import GamepadCmd, GamepadOverride  # noqa: E402
+from sim.guard import WallGuard  # noqa: E402
 from sim.robots import DEFAULT_ROBOT, ROBOTS, get_robot  # noqa: E402
 from sim.runtime import DepthCamera, PieRuntime  # noqa: E402
 from sim.keyboard import HoldCmd, KeyboardOverride  # noqa: E402
@@ -212,7 +215,9 @@ def main() -> int:
                      & (model.geom_rgba[:, 3] < 0.5))
             model.geom_rgba[walls, 3] = wall_alpha
             web_server = viser.ViserServer(port=web_port)
-            web_scene = ViserMujocoScene(web_server, model, num_envs=1)
+            # own model copy: the navcore unit on the head (depth untouched)
+            web_scene = ViserMujocoScene(web_server, web_view_model(model, robot),
+                                         num_envs=1)
             # "Track camera" force-aims every client at the world ORIGIN
             # (look_at=zeros) -- the dog lives at the spawn, not the origin,
             # so tracking off + spawn framing below.
@@ -237,6 +242,9 @@ def main() -> int:
             # read as opaque -- collision viewing is covered by the G3 group
             # toggle instead.
             web_scene.show_convex_hull = False
+            # the policy's depth camera, a small pyramid (panel toggle)
+            from webpanel import add_depth_camera
+            add_depth_camera(web_scene)
             web_scene.update_from_mjdata(data)
             # viser silently bumps to the next port when the requested one
             # is busy -- print the ACTUAL bound port, not the request.
@@ -305,10 +313,20 @@ def main() -> int:
     # command priority: physically held arrows override the gamepad (while
     # its control is on), which overrides the stack's /cmd_vel (human nudge
     # during e2e runs); release runs the gazebo 1s zero-flush, then the
-    # lower source flows again.
+    # lower source flows again. The keys' and the pad's commands ramp at the
+    # max acceleration (sim/accel.py) and stop in front of walls (sim/guard.py);
+    # the stack's passes untouched once they have handed back and the command
+    # has caught up with it.
     kb = HoldCmd()
     pad = GamepadCmd(enabled="--gamepad" in sys.argv)
-    cmd_mux = KeyboardOverride(kb, GamepadOverride(pad, face.cmd))
+    pad_mux = GamepadOverride(pad, face.cmd)
+    kb_mux = KeyboardOverride(kb, pad_mux)
+
+    def teleop() -> bool:
+        return kb_mux.state != "idle" or pad_mux.driving
+
+    accel = AccelLimit(kb_mux, engaged=teleop, brake=lambda: pad.stop_held)
+    cmd_mux = WallGuard(accel, lambda: rt, engaged=teleop)
 
     _primary = (Path(policy_path) if policy_path
                 else robot.policy_path("perception"))
@@ -320,18 +338,27 @@ def main() -> int:
     kb.set_envelope(*_pad_envelope(policy))
     print(f"robot={robot.name} policy={_primary.name} "
           f"contract={policy.contract.name}", flush=True)
+    kind = "perception"
+    # marching in place: M / pad X-Y toggle it, Stop and Reset end it
+    march = False
+    # the hips' estimated motor temperatures (panel plot)
+    from sim.thermal import HipThermal
+    thermal = HipThermal(data, b, robot.name)
 
-    # operator panel (webpanel.py): follow camera, policy depth inset,
+    # operator panel (webpanel.py): robot tracking, policy depth inset,
     # gamepad/perception toggles and the Reset/Stop buttons -- the latter
     # live ONLY here in hil (no keyboard bindings): they set the flags the
     # control loop consumes.
     panel = None
     if web_scene is not None:
-        from webpanel import OperatorPanel
+        from webpanel import OperatorPanel, guard_status, march_status, sync_depth_camera
+        if rt.uses_depth and not rt.depth_spec.pie:
+            # a navcore student moved the camera: its pyramid follows
+            sync_depth_camera(web_scene, model, rt.depth_spec)
         panel = OperatorPanel(web_server, ROBOTS, robot.name, gamepad=pad,
-                              keyboard=kb,
+                              keyboard=kb, accel=accel, guard=cmd_mux,
                               on_button=lambda name: keys.__setitem__(name, True),
-                              robot_select=False)
+                              robot_select=False, scene=sc.label or scene_name)
         panel.show_robot(robot.name, True, True, robot.has_policy("blind"))
 
     srv = None
@@ -484,10 +511,13 @@ def main() -> int:
                 keys["reset"] = False
                 reset_to_spawn(model, data, b, settle=True,
                                pos=pos, yaw_deg=yaw_deg)
+                cmd_mux.reset()
+                march = False
                 print("[RESET] back to spawn", flush=True)
             if keys["stop"]:
                 keys["stop"] = False
                 cmd_mux.zero()
+                march = False
                 print("[STOP] command zeroed (GUI Stop)", flush=True)
             request = panel.take_request() if panel is not None else None
             if request is not None and request[0] == "perception":
@@ -496,9 +526,13 @@ def main() -> int:
                     path = (_primary if kind == "perception"
                             else robot.policy_path("blind"))
                     policy = PieOnnxPolicy(path, provider="cpu")
+                    old_rt = rt
                     rt = PieRuntime(model, b, data, policy, policy_cam, cmd_mux,
                                     spawn_pos=pos, spawn_yaw_deg=yaw_deg,
                                     substep_hook=sink.sample)
+                    old_rt.close()
+                    if web_scene is not None and rt.uses_depth:
+                        sync_depth_camera(web_scene, model, rt.depth_spec)
                     pad.set_envelope(*_pad_envelope(policy))
                     kb.set_envelope(*_pad_envelope(policy))
                     print(f"[SWITCH] {kind} policy={path.name}", flush=True)
@@ -509,7 +543,18 @@ def main() -> int:
                                  robot.has_policy("blind"))
             now = time.perf_counter()
             if now >= next_ctrl:
+                if kb.consume_march() | pad.consume_march():
+                    march = not march
+                    print(f"[MARCH] {'on' if march else 'off'}", flush=True)
+                if pad.stop_held and march:
+                    march = False
+                    print("[MARCH] off (stop)", flush=True)
+                rt.march = march
                 rt.tick()
+                thermal.step(CONTROL_DT)
+                if panel is not None:
+                    panel.plot_temperatures(thermal.time, thermal.labels,
+                                            thermal.temperatures)
                 next_ctrl = max(next_ctrl + CONTROL_DT, time.perf_counter())
                 # pose snapshot for the render thread: THE stamp = pose
                 # sample time. Refs only -- each tick allocates fresh
@@ -536,17 +581,18 @@ def main() -> int:
             # forever (the original "container viewer freeze"). view_hz caps
             # the scene-repaint cost.
             if web_scene is not None and now2 - t_view >= 1 / view_hz:
-                web_scene.update_from_mjdata(data)
                 if panel is not None:
-                    pad_txt = (("on " if pad.enabled else "off ") + pad.name
-                               if pad.connected else "no pad")
-                    panel.update(
+                    pad_txt = ("开" if pad.enabled else "关") if pad.connected else "未连"
+                    # Track robot: the scene is drawn shifted and turned by
+                    # the panel
+                    web_scene.scene_offset, web_scene.scene_yaw = panel.update(
                         rt.base_pos(), data.qpos[root + 3:root + 7],
                         rt.depth_frame(),
-                        f"{robot.label} · {policy.contract.name} · "
-                        f"cmd {rt.command[0]:+.2f} "
-                        f"{rt.command[1]:+.2f} {rt.command[2]:+.2f} "
-                        f"({cmd_mux.state}) · gamepad {pad_txt}")
+                        f"{policy.contract.name} · cmd {rt.command[0]:+.2f} "
+                        f"{rt.command[1]:+.2f} {rt.command[2]:+.2f} · 手柄{pad_txt}"
+                        + march_status(march, policy.contract) + guard_status(cmd_mux))
+                    web_scene.show_camera_frustums = kind == "perception"
+                web_scene.update_from_mjdata(data)
                 t_view = now2
             elif viewer is not None and now2 - t_view >= 1 / view_hz:
                 viewer.sync()
@@ -556,7 +602,7 @@ def main() -> int:
                 n_last = n_frames
                 t_last = now2
                 print(f"cam {fps:4.1f}Hz render {render_ms:5.1f}ms "
-                      f"kb {cmd_mux.state:<5} "
+                      f"kb {kb_mux.state:<5} "
                       f"imu {face.n_imu} vio {face.n_vio} "
                       f"dropped {sink.dropped} clip {face.cmd.clipped} "
                       f"encfail {n_encode_fail}"

@@ -280,21 +280,22 @@ def preprocess_depth_z(depth_z: np.ndarray) -> np.ndarray:
 
 
 class DepthHistory:
-    """Two 10-Hz PIE depth frames, oldest first."""
+    """Two 10-Hz depth frames, oldest first (PIE's 60x86 by default; any
+    frame_shape, e.g. a navcore student's: contract_v2.DepthSpec)."""
 
-    def __init__(self, length: int = DEPTH_HISTORY_LENGTH) -> None:
+    def __init__(self, length: int = DEPTH_HISTORY_LENGTH,
+                 frame_shape: tuple[int, int] = (DEPTH_HEIGHT, DEPTH_WIDTH)) -> None:
         if length <= 0:
             raise ValueError("Depth history length must be positive.")
         self.length = int(length)
+        self.frame_shape = tuple(int(v) for v in frame_shape)
         self._frames: deque[np.ndarray] = deque(maxlen=self.length)
 
     def reset(self) -> None:
         self._frames.clear()
 
     def append(self, frame: np.ndarray) -> None:
-        value = np.asarray(frame, dtype=np.float32).reshape(
-            1, DEPTH_HEIGHT, DEPTH_WIDTH
-        )
+        value = np.asarray(frame, dtype=np.float32).reshape(1, *self.frame_shape)
         if not np.all(np.isfinite(value)):
             raise FloatingPointError("Cannot append non-finite depth.")
         if not self._frames:

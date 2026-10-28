@@ -142,7 +142,10 @@ class PieOnnxPolicy:
                 "memory_h_in": (1, 1, 128),
             }
         if self.uses_depth:
-            self.INPUT_SHAPES["depth_history"] = (1, *DEPTH_HISTORY_SHAPE)
+            # the frame it was trained on: its metadata's (contract.depth) or PIE's
+            depth = getattr(self.contract, "depth", None)
+            self.INPUT_SHAPES["depth_history"] = (
+                1, *(depth.history_shape if depth is not None else DEPTH_HISTORY_SHAPE))
         self.OUTPUT_SHAPES = {"actions": (1, self.contract.NUM_ACTIONS)}
         if self.recurrent:
             self.OUTPUT_SHAPES["memory_h_out"] = (1, 1, 128)
@@ -212,7 +215,7 @@ class PieOnnxPolicy:
         }
         if self.uses_depth:
             inputs["depth_history"] = np.asarray(
-                depth_history, dtype=np.float32).reshape(1, *DEPTH_HISTORY_SHAPE)
+                depth_history, dtype=np.float32).reshape(self.INPUT_SHAPES["depth_history"])
         outputs = self.session.run(["actions", "memory_h_out"], inputs)
         action = np.asarray(outputs[0], dtype=np.float32)
         memory_h = np.asarray(outputs[1], dtype=np.float32)

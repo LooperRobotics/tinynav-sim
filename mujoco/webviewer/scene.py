@@ -94,6 +94,23 @@ def _get_unit_mesh(geom_type: int) -> trimesh.Trimesh:
   return _UNIT_MESHES[geom_type]
 
 
+# LOCAL PATCH: the scene_yaw rotation (see ViserMujocoScene.scene_yaw).
+def _z_rotation(yaw: float) -> tuple[np.ndarray, np.ndarray]:
+  """(3x3 matrix, wxyz quaternion) of a rotation by `yaw` about +z."""
+  c, s = np.cos(yaw), np.sin(yaw)
+  rot = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+  return rot, np.array([np.cos(yaw / 2), 0.0, 0.0, np.sin(yaw / 2)])
+
+
+def _z_rotate_quats(q: np.ndarray, quats: np.ndarray) -> np.ndarray:
+  """q * quats for a z rotation q = (w, 0, 0, z); quats wxyz, any leading shape."""
+  w, z = q[0], q[3]
+  qw, qx, qy, qz = np.moveaxis(quats, -1, 0)
+  return np.stack(
+    [w * qw - z * qz, w * qx - z * qy, w * qy + z * qx, w * qz + z * qw], axis=-1
+  )
+
+
 class ViserMujocoScene:
   """Manages Viser scene handles and visualization state for MuJoCo models.
 
@@ -108,6 +125,7 @@ class ViserMujocoScene:
     server: viser.ViserServer,
     mj_model: mujoco.MjModel,
     num_envs: int,
+    mesh_cache: dict | None = None,
   ) -> None:
     """Create and populate a scene with geometry.
 
@@ -115,11 +133,15 @@ class ViserMujocoScene:
         server: Viser server instance.
         mj_model: MuJoCo model.
         num_envs: Number of parallel environments.
+        mesh_cache: Merged body meshes of this same model (or a copy of it:
+            the keys hold model-local ids), filled by fill_mesh_cache or an
+            earlier scene; reused instead of merged again.
     """
     self.server = server
     self.mj_model = mj_model
     self.mj_data = mujoco.MjData(mj_model)
     self.num_envs = num_envs
+    self._mesh_cache = mesh_cache
 
     # mjvScene infrastructure for decor visualization.
     self._mjv_scene = mujoco.MjvScene(mj_model, maxgeom=max(2000, mj_model.ngeom * 2))
@@ -146,10 +168,24 @@ class ViserMujocoScene:
     self._show_convex_hull: bool = False
     self._hull_hide_meshes: bool = False
     self._autoconnect_hide_meshes: bool = False
+    # LOCAL PATCH: model cameras drawn as frustums (add_camera_frustum):
+    # (camera id, frustum-from-camera-body rotation, handle).
+    self._camera_frustums: list[tuple[int, np.ndarray, viser.CameraFrustumHandle]] = []
+    self._show_camera_frustums: bool = True
 
     # Visualization settings.
     self.env_idx = 0
     self.camera_tracking_enabled = True
+    # Frame newly connected clients at the default view (False: the host
+    # frames them itself, e.g. view.py's Track robot).
+    self.frame_clients = True
+    # LOCAL PATCH: host-driven scene transform, viewer = Rz(scene_yaw)
+    # (world + scene_offset) (view.py's Track robot: minus the low-passed
+    # base, turned against its heading, so the browser's orbit controls
+    # circle the robot and keep their angle to it); scene_offset None = the
+    # tracking above, if on.
+    self.scene_offset: np.ndarray | None = None
+    self.scene_yaw = 0.0
     self.show_only_selected = False
     self.geom_groups_visible = [True, True, True, False, False, False]
     self.site_groups_visible = [True, True, True, False, False, False]
@@ -264,6 +300,57 @@ class ViserMujocoScene:
       for handle, _ in self._hull_dynamic_handles:
         handle.visible = value
       self._sync_visibilities()
+
+  # LOCAL PATCH: camera frustums.
+  @property
+  def show_camera_frustums(self) -> bool:
+    return self._show_camera_frustums
+
+  @show_camera_frustums.setter
+  def show_camera_frustums(self, value: bool) -> None:
+    with self._update_lock:
+      self._show_camera_frustums = bool(value)
+      for _, _, handle in self._camera_frustums:
+        handle.visible = bool(value)
+
+  def add_camera_frustum(
+    self, camera: str, aspect: float, depth: float, **kwargs
+  ) -> viser.CameraFrustumHandle:
+    """Draw the model camera `camera` (fixed to its body) as a pyramid that
+    rides the body: apex at the camera, opening its fovy by `aspect` (image
+    width / height), `depth` m deep. kwargs go to viser's
+    add_camera_frustum (color, variant, thickness, ...); show_camera_frustums
+    hides them all."""
+    cam = mujoco.mj_name2id(self.mj_model, mjtObj.mjOBJ_CAMERA, camera)
+    if cam < 0:
+      raise ValueError(f"model has no camera {camera!r}")
+    fov = np.radians(float(self.mj_model.cam_fovy[cam]))
+    # viser scales a frustum to a fixed volume: depth = scale / cbrt(x y / 3)
+    # with x, y = tan(fov / 2) (aspect, 1)
+    half = np.tan(fov / 2)
+    handle = self.server.scene.add_camera_frustum(
+      f"/camera_frustum_{camera}",
+      fov=fov,
+      aspect=aspect,
+      scale=depth * np.cbrt(half * half * aspect / 3.0),
+      visible=self._show_camera_frustums,
+      **kwargs,
+    )
+    # MuJoCo cameras look down -z with +y up, viser's frustums down +z with
+    # +y down (OpenCV)
+    local = vtf.SO3(self.mj_model.cam_quat[cam]).as_matrix() @ np.diag([1.0, -1.0, -1.0])
+    with self._update_lock:
+      self._camera_frustums.append((cam, local, handle))
+      self._refresh_visualization_locked()
+    return handle
+
+  def clear_camera_frustums(self) -> None:
+    """Remove every frustum add_camera_frustum drew (to redraw a camera that
+    moved or changed its field of view in mj_model)."""
+    with self._update_lock:
+      for _, _, handle in self._camera_frustums:
+        handle.remove()
+      self._camera_frustums = []
 
   def set_refresh_handler(self, handler: Callable[[], None] | None) -> None:
     """Install a callback used to refresh cached visualization state."""
@@ -429,7 +516,7 @@ class ViserMujocoScene:
       # LOCAL PATCH: no "Track camera" checkbox when tracking is off at build
       # time. Its tracking shifts the scene so the first free body sits at the
       # origin and aims the camera there, which fought the hosts' own framing
-      # (view.py's Track robot chases the robot in world coordinates).
+      # (view.py's Track robot moves the scene itself: scene_offset/_yaw).
       if self.camera_tracking_enabled:
         cb_camera_tracking = self.server.gui.add_checkbox(
           "Track camera",
@@ -462,11 +549,21 @@ class ViserMujocoScene:
         for client in self.server.get_clients().values():
           client.camera.fov = np.radians(slider_fov.value)
 
-      @self.server.on_client_connect
-      def _(client: viser.ClientHandle) -> None:
+      def _on_connect(client: viser.ClientHandle) -> None:
         client.camera.fov = np.radians(slider_fov.value)
-        client.camera.position = _camera_offset
-        client.camera.look_at = np.zeros(3) if self.camera_tracking_enabled else _center
+        if self.frame_clients:
+          client.camera.position = _camera_offset
+          client.camera.look_at = np.zeros(3) if self.camera_tracking_enabled else _center
+
+      # LOCAL PATCH: one connect hook per server, calling the newest scene's.
+      # viser runs a hook on every connected client the moment it is added,
+      # so a hook per rebuilt scene (view.py's robot switch) re-framed all
+      # open pages -- and the pile of hooks kept every old scene alive.
+      server = self.server
+      first = getattr(server, "_scene_on_connect", None) is None
+      server._scene_on_connect = _on_connect
+      if first:
+        server.on_client_connect(lambda client: server._scene_on_connect(client))
 
   def create_overlay_gui(self) -> None:
     """Add overlay visualization controls into the current GUI context.
@@ -842,10 +939,7 @@ class ViserMujocoScene:
       nworld = body_xpos.shape[0]
       mocap_quat = np.zeros((nworld, max(self.mj_model.nmocap, 0), 4))
 
-    scene_offset = np.zeros(3)
-    if self.camera_tracking_enabled and self._tracked_body_id is not None:
-      tracked_pos = body_xpos[env_idx, self._tracked_body_id, :].copy()
-      scene_offset = -tracked_pos
+    scene_offset = self._scene_offset_for(body_xpos, env_idx)
 
     mj_data: mujoco.MjData | None = None
     if self._any_decor_visible() and qpos is not None and qvel is not None:
@@ -884,10 +978,7 @@ class ViserMujocoScene:
       mocap_pos = np.zeros((1, 0, 3))
       mocap_quat = np.zeros((1, 0, 4))
     env_idx = 0
-    scene_offset = np.zeros(3)
-    if self.camera_tracking_enabled and self._tracked_body_id is not None:
-      tracked_pos = mj_data.xpos[self._tracked_body_id, :].copy()
-      scene_offset = -tracked_pos
+    scene_offset = self._scene_offset_for(body_xpos, env_idx)
 
     self._update_visualization(
       body_xpos,
@@ -944,20 +1035,37 @@ class ViserMujocoScene:
     if mj_data is not None:
       self._last_mj_data = mj_data
 
-    self.fixed_bodies_frame.position = scene_offset
+    # LOCAL PATCH: viewer = rot (world + scene_offset) = rot world + shift;
+    # the poses below are turned by rot first, then shifted
+    rot, rot_wxyz = _z_rotation(self.scene_yaw)
+    shift = rot @ scene_offset
+    self.fixed_bodies_frame.position = shift
+    self.fixed_bodies_frame.wxyz = rot_wxyz
     slice_single = self.show_only_selected and self.num_envs > 1
     with self.server.atomic():
-      body_xquat = vtf.SO3.from_matrix(body_xmat).wxyz
+      # LOCAL PATCH: camera frustums ride their bodies (the shown env's)
+      if self._show_camera_frustums:
+        for cam, local, handle in self._camera_frustums:
+          body = self.mj_model.cam_bodyid[cam]
+          xmat = body_xmat[env_idx, body]
+          handle.position = (
+            rot @ (body_xpos[env_idx, body] + xmat @ self.mj_model.cam_pos[cam]) + shift
+          )
+          handle.wxyz = vtf.SO3.from_matrix(rot @ xmat @ local).wxyz
+      body_xquat = _z_rotate_quats(rot_wxyz, vtf.SO3.from_matrix(body_xmat).wxyz)
+      body_xpos = body_xpos @ rot.T
+      mocap_pos = mocap_pos @ rot.T
+      mocap_quat = _z_rotate_quats(rot_wxyz, mocap_quat)
       for mg in self._mesh_groups:
         if not mg.handle.visible:
           continue
         if mg.mocap_ids is not None:
           pos, quat = self._batched_transform_group(
-            mocap_pos, mocap_quat, mg.mocap_ids, env_idx, scene_offset, slice_single
+            mocap_pos, mocap_quat, mg.mocap_ids, env_idx, shift, slice_single
           )
         else:
           pos, quat = self._batched_transform_group(
-            body_xpos, body_xquat, mg.body_ids, env_idx, scene_offset, slice_single
+            body_xpos, body_xquat, mg.body_ids, env_idx, shift, slice_single
           )
         mg.handle.batched_positions = pos
         mg.handle.batched_wxyzs = quat
@@ -966,7 +1074,7 @@ class ViserMujocoScene:
         if not handle.visible:
           continue
         pos, quat = self._batched_transform(
-          body_xpos, body_xquat, body_id, env_idx, scene_offset, slice_single
+          body_xpos, body_xquat, body_id, env_idx, shift, slice_single
         )
         handle.batched_positions = pos
         handle.batched_wxyzs = quat
@@ -976,13 +1084,13 @@ class ViserMujocoScene:
           if not handle.visible:
             continue
           pos, quat = self._batched_transform(
-            body_xpos, body_xquat, body_id, env_idx, scene_offset, slice_single
+            body_xpos, body_xquat, body_id, env_idx, shift, slice_single
           )
           handle.batched_positions = pos
           handle.batched_wxyzs = quat
 
       if self._any_decor_visible() and mj_data is not None:
-        self._update_decor_from_mjvscene(mj_data, scene_offset)
+        self._update_decor_from_mjvscene(mj_data, rot, shift)
       elif not self._any_decor_visible():
         self._clear_decor_handles()
 
@@ -1030,6 +1138,14 @@ class ViserMujocoScene:
       quat = quats[:, ids, :].reshape(-1, 4)
     return pos, quat
 
+  def _scene_offset_for(self, body_xpos: np.ndarray, env_idx: int) -> np.ndarray:
+    """viewer = world + offset: the host's scene_offset, else the tracking one."""
+    if self.scene_offset is not None:
+      return np.array(self.scene_offset, dtype=np.float64)
+    if self.camera_tracking_enabled and self._tracked_body_id is not None:
+      return -body_xpos[env_idx, self._tracked_body_id, :].copy()
+    return np.zeros(3)
+
   def request_update(self) -> None:
     """Request a visualization update and trigger immediate re-render
     from cache."""
@@ -1053,12 +1169,7 @@ class ViserMujocoScene:
     ):
       return
 
-    scene_offset = np.zeros(3)
-    if self.camera_tracking_enabled and self._tracked_body_id is not None:
-      tracked_pos = self._last_body_xpos[
-        self._last_env_idx, self._tracked_body_id, :
-      ].copy()
-      scene_offset = -tracked_pos
+    scene_offset = self._scene_offset_for(self._last_body_xpos, self._last_env_idx)
 
     self._update_visualization_locked(
       self._last_body_xpos,
@@ -1174,37 +1285,56 @@ class ViserMujocoScene:
       )
     return (is_mocap, tuple(sorted(parts)))
 
-  def _create_mesh_handles_by_group(self) -> None:
-    """Create mesh handles, deduplicating identical geometries across bodies."""
+  @classmethod
+  def _body_mesh_groups(
+    cls, mj_model: mujoco.MjModel
+  ) -> dict[tuple[object, ...], tuple[list[int], list[int], bool, int, int]]:
+    """Unique non-fixed body geometries: key -> (bodies, geoms, mocap, group, sub)."""
     # Step 1: Group geoms by (body_id, group_id).
     body_group_geoms: dict[tuple[int, int], list[int]] = {}
-    for i in range(self.mj_model.ngeom):
-      body_id = self.mj_model.geom_bodyid[i]
-      if is_fixed_body(self.mj_model, body_id):
+    for i in range(mj_model.ngeom):
+      body_id = mj_model.geom_bodyid[i]
+      if is_fixed_body(mj_model, body_id):
         continue
-      if self.mj_model.geom_rgba[i, 3] == 0:
+      if mj_model.geom_rgba[i, 3] == 0:
         continue
-      geom_group = self.mj_model.geom_group[i]
+      geom_group = mj_model.geom_group[i]
       body_group_geoms.setdefault((body_id, geom_group), []).append(i)
 
     # Group bodies sharing identical geometry by fingerprint.
     fp_info: dict[tuple[object, ...], tuple[list[int], list[int], bool, int, int]] = {}
     for (body_id, group_id), geom_indices in body_group_geoms.items():
-      subgroups = group_geoms_by_visual_compat(self.mj_model, geom_indices)
-      is_mocap = bool(self.mj_model.body_mocapid[body_id] >= 0)
+      subgroups = group_geoms_by_visual_compat(mj_model, geom_indices)
+      is_mocap = bool(mj_model.body_mocapid[body_id] >= 0)
       for sub_idx, sub_geom_ids in enumerate(subgroups):
-        fp = self._geom_subgroup_fingerprint(self.mj_model, sub_geom_ids, is_mocap)
+        fp = cls._geom_subgroup_fingerprint(mj_model, sub_geom_ids, is_mocap)
         key = (fp, group_id, sub_idx)
         if key in fp_info:
           fp_info[key][0].append(body_id)
         else:
           fp_info[key] = ([body_id], sub_geom_ids, is_mocap, group_id, sub_idx)
+    return fp_info
+
+  @classmethod
+  def fill_mesh_cache(cls, mj_model: mujoco.MjModel, mesh_cache: dict) -> None:
+    """Merge every body mesh of mj_model into mesh_cache ahead of time (no
+    server needed): a scene built later with this cache skips the merge."""
+    for key, (_, geom_ids, *_rest) in cls._body_mesh_groups(mj_model).items():
+      if key not in mesh_cache:
+        mesh_cache[key] = merge_geoms(mj_model, geom_ids)
+
+  def _create_mesh_handles_by_group(self) -> None:
+    """Create mesh handles, deduplicating identical geometries across bodies."""
+    fp_info = self._body_mesh_groups(self.mj_model)
 
     # Create one batched handle per unique geometry.
     with self.server.atomic():
-      for body_ids, geom_ids, is_mocap, group_id, sub_idx in fp_info.values():
-        mesh = merge_geoms(self.mj_model, geom_ids)
-        lod_ratio = 1000.0 / mesh.vertices.shape[0]
+      for key, (body_ids, geom_ids, is_mocap, group_id, sub_idx) in fp_info.items():
+        mesh = None if self._mesh_cache is None else self._mesh_cache.get(key)
+        if mesh is None:
+          mesh = merge_geoms(self.mj_model, geom_ids)
+          if self._mesh_cache is not None:
+            self._mesh_cache[key] = mesh
 
         batch_count = len(body_ids) * self.num_envs
         body_name = get_body_name(self.mj_model, body_ids[0])
@@ -1216,7 +1346,9 @@ class ViserMujocoScene:
           mesh,
           batched_wxyzs=np.tile([1.0, 0.0, 0.0, 0.0], (batch_count, 1)),
           batched_positions=np.zeros((batch_count, 3)),
-          lod=((2.0, lod_ratio),) if lod_ratio < 0.5 else "off",
+          # Full detail at any distance: one robot here, and the 2 m LOD
+          # (~1000-vertex stand-ins) was what a view following it showed.
+          lod="off",
           visible=visible,
         )
 
@@ -1376,12 +1508,13 @@ class ViserMujocoScene:
       handle.visible = False
 
   def _update_decor_from_mjvscene(
-    self, mj_data: mujoco.MjData, scene_offset: np.ndarray
+    self, mj_data: mujoco.MjData, rot: np.ndarray, shift: np.ndarray
   ) -> None:
     """Update overlay visualization using mjvScene.
 
     Calls ``mjv_updateScene`` to generate decorative geoms (contacts,
-    tendons, frames, inertia) and renders them as batched viser meshes.
+    tendons, frames, inertia) and renders them as batched viser meshes,
+    placed at viewer = rot world + shift (LOCAL PATCH: scene_yaw).
     """
     mujoco.mjv_updateScene(
       self.mj_model,
@@ -1461,8 +1594,8 @@ class ViserMujocoScene:
 
       for j, gi in enumerate(indices):
         g = self._mjv_scene.geoms[gi]
-        pos = np.array(g.pos) + scene_offset
-        mat = np.array(g.mat).reshape(3, 3)
+        pos = rot @ np.array(g.pos) + shift
+        mat = rot @ np.array(g.mat).reshape(3, 3)
         quat = vtf.SO3.from_matrix(mat).wxyz
         size = np.array(g.size)
         rgba = np.array(g.rgba)
