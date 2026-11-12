@@ -1,8 +1,9 @@
-# MetaCam office workflow
+# MetaCam to TinyNav simulation workflow
 
-This prototype builds an office scene from a MetaBag V2 capture and starts
-TinyNav using the generated assets. The target is x64 Linux with an NVIDIA
-GPU. The office calibration comes from `info/calibration.json` in the capture.
+This workflow reconstructs a scene from a compatible MetaCam MetaBag V2 capture
+and starts TinyNav using the generated assets. It targets x64 Linux with an
+NVIDIA GPU and reads sensor calibration from each capture’s
+`info/calibration.json`. The office capture is the current validation dataset.
 
 Build TinyNav through Pilot's native build first, including its Flutter web
 app and ROS interfaces. Provide a Lightning-LM checkout and the Spirula
