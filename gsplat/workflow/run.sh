@@ -26,7 +26,7 @@ for weight in sam2.1_hiera_base_plus_f16.ggml grounding-dino-base.safetensors be
     [[ -s "$weights/$weight" ]] || { printf 'Missing weight: %s\n' "$weights/$weight" >&2; exit 1; }
 done
 "$workflow/preflight.sh" "$capture" "$capture/info/calibration.json" "$output" "$image"
-if [[ -e "$output/workflow-stage" && ${METACAM_RESUME_MASKS:-0} != 1 ]]; then
+if [[ -e "$output/workflow-stage" && ${METACAM_RESUME_MASKS:-0} != 1 && ${METACAM_RESUME_RENDER:-0} != 1 ]]; then
     printf 'Choose a fresh output directory: %s\n' "$output" >&2
     exit 1
 fi
@@ -41,8 +41,9 @@ for icd in "${METACAM_VULKAN_ICD:-}" /etc/vulkan/icd.d/nvidia_icd.json /usr/shar
     fi
 done
 
-docker run --detach --init --name "$name" --gpus all --network host --shm-size=1g \
+docker run --detach --init --name "$name" --gpus all --network host --shm-size=16g \
     "${vulkan_options[@]}" --env "METACAM_RESUME_MASKS=${METACAM_RESUME_MASKS:-0}" \
+    --env "METACAM_RESUME_RENDER=${METACAM_RESUME_RENDER:-0}" \
     --env "METACAM_ACCEPT_SAM_LICENSE=${METACAM_ACCEPT_SAM_LICENSE:-0}" \
     --env "METACAM_WEB_PORT=$port" --env NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics,video \
     --mount "type=bind,source=$workflow/run-in-container.sh,target=/opt/metacam/run,readonly" \

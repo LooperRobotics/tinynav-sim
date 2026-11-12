@@ -109,7 +109,7 @@ start renderer "$python" "$tools/runtime/server.py"
 start sensors "$ros_python" "$tools/runtime/looper_emu.py" \
     --ring /scene/sim-runtime/sensors.bin --cmd-file /scene/sim-runtime/cmd.txt --fx 272
 start bridge "$ros_python" /tinynav/tool/looper_bridge_node.py
-for action in nav turn snapshot reloop link_fit; do
+for action in nav turn capture; do
     start "server-$action" "$ros_python" -m "servers.$action" "/pilot/$action"
 done
 start frontend "$ros_python" /workspace/deploy/serve_web.py \
