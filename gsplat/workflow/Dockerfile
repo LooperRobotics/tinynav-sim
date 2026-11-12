@@ -12,6 +12,7 @@ COPY --from=spirula-libs /spirula-libs/ /opt/spirula/lib/
 COPY bundle/spirula /opt/spirula/bin/spirula
 COPY bundle/app/ /workspace/
 COPY bundle/tinynav/ /tinynav/
+RUN mkdir -p /workspace/drivers && ln -sfn /tinynav/tool/looper_bridge_node.py /workspace/drivers/looper_bridge_node.py
 COPY metacam/ /opt/metacam/
 COPY runtime/ /opt/metacam/runtime/
 COPY run-in-container.sh /opt/metacam/run

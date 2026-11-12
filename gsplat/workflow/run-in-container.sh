@@ -92,6 +92,25 @@ export TINYNAV_PLANNER=library TINYNAV_FEATURE_MATCHER=lightglue
 export UV_PROJECT_ENVIRONMENT=/opt/venv PYTHONUNBUFFERED=1
 unset TINYNAV_DEPTH_NO_RETURN_RANGE
 mkdir -p "$TINYNAV_DB_PATH"
+models=/tinynav/tinynav/models
+engine_cache=/scene/tensorrt-engines
+mkdir -p "$engine_cache"
+# Build with the target GPU and TensorRT runtime. Keep the plans with this run.
+for model in superpoint_fp16_dynamic lightglue_fp16 dinov2_base_224x224_fp16 \
+    siglip_vit_b_16_webli_image_fp16 siglip_vit_b_16_webli_text_fp16; do
+    plan="${model}_$(uname -m).plan"
+    if [[ -s "$engine_cache/$plan" ]]; then
+        cp "$engine_cache/$plan" "$models/$plan"
+    fi
+done
+step engines make -C "$models" -j1 superpoint lightglue dinov2 siglip
+for model in superpoint_fp16_dynamic lightglue_fp16 dinov2_base_224x224_fp16 \
+    siglip_vit_b_16_webli_image_fp16 siglip_vit_b_16_webli_text_fp16; do
+    plan="${model}_$(uname -m).plan"
+    test -s "$models/$plan"
+    cp "$models/$plan" "$engine_cache/$plan.tmp"
+    mv "$engine_cache/$plan.tmp" "$engine_cache/$plan"
+done
 
 printf '%s\n' launch > /scene/workflow-stage
 cd /workspace
@@ -105,10 +124,11 @@ start() {
     "$@" > "$logs/$name.log" 2>&1 &
     pids+=("$!")
 }
-start renderer "$python" "$tools/runtime/server.py"
+start renderer "$python" "$tools/runtime/server.py" --resume
 start sensors "$ros_python" "$tools/runtime/looper_emu.py" \
     --ring /scene/sim-runtime/sensors.bin --cmd-file /scene/sim-runtime/cmd.txt --fx 272
 start bridge "$ros_python" /tinynav/tool/looper_bridge_node.py
+start planning-vis "$ros_python" /tinynav/tinynav/core/planning_vis_node.py
 for action in nav turn capture; do
     start "server-$action" "$ros_python" -m "servers.$action" "/pilot/$action"
 done
