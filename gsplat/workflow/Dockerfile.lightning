@@ -1,0 +1,26 @@
+ARG TINYNAV_IMAGE=navcore-tinynav:local
+FROM ${TINYNAV_IMAGE}
+
+USER root
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ARG BUILD_JOBS=6
+ENV CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS}
+ENV MAKEFLAGS=-j${BUILD_JOBS}
+
+COPY thirdparty/Pangolin-0.9.3.zip /tmp/pangolin.zip
+RUN unzip -q /tmp/pangolin.zip -d /tmp \
+    && cmake -S /tmp/Pangolin-0.9.3 -B /tmp/pangolin-build \
+        -DCMAKE_BUILD_TYPE=Release -DBUILD_TOOLS=OFF -DBUILD_EXAMPLES=OFF \
+        -DBUILD_PANGOLIN_PYTHON=OFF -DBUILD_PANGOLIN_VIDEO=OFF -DBUILD_TESTS=OFF \
+    && cmake --build /tmp/pangolin-build \
+    && cmake --install /tmp/pangolin-build \
+    && ldconfig \
+    && rm -rf /tmp/Pangolin-0.9.3 /tmp/pangolin-build /tmp/pangolin.zip
+
+COPY . /root/slam_ws/src/lightning-lm
+WORKDIR /root/slam_ws
+RUN sed -i 's/reader.open({bag_file_, "mcap"}, cv_options)/reader.open({bag_file_, ""}, cv_options)/' src/lightning-lm/src/wrapper/bag_io.cc
+RUN source /opt/ros/humble/setup.bash \
+    && colcon build --executor sequential --cmake-args \
+        -DCMAKE_BUILD_TYPE=Release -DPython3_EXECUTABLE=/usr/bin/python3 \
+        -DPYTHON_EXECUTABLE=/usr/bin/python3 -DLIVOX_ROS_DRIVER2_VERSION=1.0.0
