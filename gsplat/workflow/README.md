@@ -18,7 +18,7 @@ METACAM_WEB_HOST=HOST_IP ./run.sh /path/to/capture /path/to/new-output /path/to/
 The image contains the workflow and app. The existing MQTT and WebRTC services
 must be reachable from the host network. The runner prints the App URL after
 the web endpoint responds and rendered frames advance. It leaves the container
-running for interactive use. Use `docker stop tinynav-metacam-office` to stop it.
+running for interactive use. Use `docker stop tinynav-metacam` to stop it.
 
 The capture and weights are mounted read-only. Logs, checkpoints and the
 scene persist in the output directory. The runner records the current stage in `workflow-stage` and defaults to a

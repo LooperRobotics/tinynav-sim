@@ -33,7 +33,7 @@ export ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-64}
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 unset CYCLONEDDS_URI
 if [[ ${METACAM_RESUME_RENDER:-0} == 1 ]]; then
-    [[ -s /scene/sim-runtime/scene-assets.json && -s /scene/outputs/office-ba-30k/step-000030000.ckpt/splat.ply ]]
+    [[ -s /scene/sim-runtime/scene-assets.json ]]
 else
     if [[ ${METACAM_RESUME_MASKS:-0} == 1 ]]; then
         [[ $(cat /scene/workflow-stage) == sam-left && -s /scene/colmap/align_stats.json &&
@@ -76,7 +76,7 @@ else
     step combine "$python" "$tools/prepare_dataset.py" combine
     step dataset "$python" "$tools/prepare_dataset.py" adapter
     step train spirula train 3dgs --data /scene/spirula_ba --output-dir-prefix /scene/outputs \
-        --output-dir-name office-ba-30k --num-iterations 30000 --disable-viewer 1 \
+        --output-dir-name scene-ba-30k --num-iterations 30000 --disable-viewer 1 \
         --keep-viewer-alive 0 --scene-center none --orientation-method none --eval-mode interval \
         --eval-interval 8 --save-eval-images 1 --eval-lpips 0 --cap-max 2000000 \
         --cache-images disk --apply-loss-for-mask 0 --save-full-checkpoint 1
@@ -87,7 +87,7 @@ step validate "$python" "$tools/runtime/validate.py"
 
 export PYTHONPATH="/workspace/vendor:/workspace:/tinynav:${PYTHONPATH:-}"
 export TINYNAV_SENSOR_MODE=looper ROBOT_TYPE=go2 TINYNAV_DB_PATH=/scene/db
-export TAILNET_NAME=home-metacam CHASSIS_NET_IFACE=lo CHASSIS_NET_WAIT_SEC=0
+export TAILNET_NAME=metacam-sim CHASSIS_NET_IFACE=lo CHASSIS_NET_WAIT_SEC=0
 export TINYNAV_PLANNER=library TINYNAV_FEATURE_MATCHER=lightglue
 export UV_PROJECT_ENVIRONMENT=/opt/venv PYTHONUNBUFFERED=1
 unset TINYNAV_DEPTH_NO_RETURN_RANGE
