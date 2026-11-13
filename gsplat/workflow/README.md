@@ -31,3 +31,11 @@ create a copy of the host NVIDIA ICD manifest that uses
 `libEGL_nvidia.so.0` as its `library_path`. Pass its absolute path as
 `METACAM_VULKAN_ICD` when invoking the runner. The host manifest stays intact.
 Check the SAM log for the NVIDIA device before relying on GPU throughput.
+
+## Scene picker
+
+Edit `scenes/scenes.json` with the browser-accessible URL of each running
+TinyNav scene. Serve the directory with any static HTTP server, for example
+`python3 -m http.server 8766 --directory scenes` from this workflow directory.
+For remote clients, use each host's reachable address in the JSON file.
+The picker opens the selected TinyNav web app in a new tab.
