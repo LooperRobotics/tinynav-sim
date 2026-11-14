@@ -43,6 +43,24 @@ async function loadScenes() {
     link.textContent = '打开 TinyNav ↗';
     link.target = '_blank';
     link.rel = 'noopener';
+    if (scene.id) {
+      link.removeAttribute('target');
+      link.onclick = async event => {
+        event.preventDefault();
+        if (link.dataset.busy) return;
+        link.dataset.busy = 'true';
+        address.textContent = '正在激活场景…';
+        try {
+          const result = await fetch('/activate/' + encodeURIComponent(scene.id), {method: 'POST'});
+          const data = await result.json();
+          if (!result.ok) throw new Error(data.error);
+          location.assign(data.url);
+        } catch (error) {
+          address.textContent = error.message;
+          delete link.dataset.busy;
+        }
+      };
+    }
     card.append(name, address, link);
     container.append(card);
   }

@@ -124,7 +124,20 @@ start() {
     "$@" > "$logs/$name.log" 2>&1 &
     pids+=("$!")
 }
+previous_frame=$(stat -c %y /scene/sim-runtime/front.jpg 2>/dev/null || true)
 start renderer "$python" "$tools/runtime/server.py" --resume
+for ((attempt=0; attempt<150; attempt++)); do
+    kill -0 "${pids[0]}"
+    current_frame=$(stat -c %y /scene/sim-runtime/front.jpg 2>/dev/null || true)
+    if [[ -n "$current_frame" && "$current_frame" != "$previous_frame" ]]; then
+        break
+    fi
+    sleep 0.2
+done
+if [[ -z "$current_frame" || "$current_frame" == "$previous_frame" ]]; then
+    echo 'Renderer did not produce a fresh frame. See renderer.log.' >&2
+    exit 1
+fi
 start sensors "$ros_python" "$tools/runtime/looper_emu.py" \
     --ring /scene/sim-runtime/sensors.bin --cmd-file /scene/sim-runtime/cmd.txt --fx 272
 start bridge "$ros_python" /tinynav/tool/looper_bridge_node.py
