@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TinyNav · 仿真场景</title>
+<style>
+:root{color-scheme:dark;font-family:Inter,system-ui,sans-serif;background:#10161d;color:#edf3f6}
+body{max-width:880px;margin:10vh auto;padding:0 24px}
+h1{font-size:clamp(32px,6vw,58px);margin:12px 0 32px}
+small{color:#83dfc8;font-weight:700;letter-spacing:.1em}
+#scenes{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px}
+article{display:flex;flex-direction:column;align-items:flex-start;background:#19232e;border:1px solid #354554;border-radius:16px;padding:24px}
+h2{margin:0;font-size:22px}p{color:#b4c3ce;overflow-wrap:anywhere}
+a{margin-top:auto;background:#83dfc8;color:#10221e;padding:10px 16px;border-radius:8px;font-weight:700;text-decoration:none}
+a:focus-visible{outline:3px solid white;outline-offset:4px}
+</style>
+<main>
+<small>TINYNAV SIM</small>
+<h1>选择仿真场景</h1>
+<div id="scenes"></div>
+</main>
+<script>
+async function loadScenes() {
+  const response = await fetch('./scenes.json', {cache: 'no-store'});
+  if (!response.ok) throw new Error('无法加载场景配置');
+    const scenes = await response.json();
+    if (!Array.isArray(scenes)) throw new Error('场景配置必须是列表');
+    return scenes;
+  }
+  async function renderScenes() {
+  const scenes = await loadScenes();
+  const container = document.querySelector('#scenes');
+  for (const scene of scenes) {
+    const url = new URL(scene.url, window.location.href);
+    if (!['http:', 'https:'].includes(url.protocol)) continue;
+    const card = document.createElement('article');
+    const name = document.createElement('h2');
+    name.textContent = scene.name;
+    const address = document.createElement('p');
+    address.textContent = url.host;
+    const link = document.createElement('a');
+    link.href = url.href;
+    link.textContent = '打开 TinyNav ↗';
+    link.target = '_blank';
+    link.rel = 'noopener';
+    if (scene.id) {
+      link.removeAttribute('target');
+      link.onclick = async event => {
+        event.preventDefault();
+        if (link.dataset.busy) return;
+        link.dataset.busy = 'true';
+        address.textContent = '正在激活场景…';
+        try {
+          const result = await fetch('/activate/' + encodeURIComponent(scene.id), {method: 'POST'});
+          const data = await result.json();
+          if (!result.ok) throw new Error(data.error);
+          location.assign(data.url);
+        } catch (error) {
+          address.textContent = error.message;
+          delete link.dataset.busy;
+        }
+      };
+    }
+    card.append(name, address, link);
+    container.append(card);
+  }
+}
+renderScenes().catch(error => {
+  document.querySelector('#scenes').textContent = error.message;
+});
+</script>
+</html>

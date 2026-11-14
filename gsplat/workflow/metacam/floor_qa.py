@@ -1,0 +1,3 @@
+import numpy as np,open3d as o,json
+from pathlib import Path
+p=Path('/scene'); a=np.load(p/'map-qa.npz'); x=a['xyz']; low=x[(x[:,2]<-.8)&(x[:,2]>-2.0)]; c=o.geometry.PointCloud(); c.points=o.utility.Vector3dVector(low); plane,idx=c.segment_plane(.035,3,1500); n=np.array(plane[:3]); n*=np.sign(n[2]);r={'plane':plane.tolist(),'inliers':len(idx),'candidates':len(low),'tilt_deg':float(np.degrees(np.arccos(n[2]/np.linalg.norm(n)))),'floor_z_at_origin':float(-plane[3]/plane[2]),'residual_abs_median_m':float(np.median(np.abs(low[idx]@np.array(plane[:3])+plane[3])))}; (p/'floor-qa.json').write_text(json.dumps(r,indent=2));print(json.dumps(r,indent=2))
